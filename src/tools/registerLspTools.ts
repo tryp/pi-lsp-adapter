@@ -1,4 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { LspExtensionState } from "../state.js";
 import { setLspStatusLine } from "../statusLine.js";
@@ -20,6 +23,12 @@ import {
 import { LSP_RESULT_ID_LENGTH, LSP_RESULT_ID_PATTERN } from "./resultCache.js";
 
 export type GetLspToolState = () => LspExtensionState | null;
+
+function registerToolPromptGuidelines(pi: ExtensionAPI): void {
+  pi.registerToolPromptGuidelines("read", [
+    "Do NOT use read for discovering file structure (functions, classes, variables, imports). Use lsp_document_symbols first — it returns structure directly. Only read specific line ranges after you know what to look for.",
+  ]);
+}
 
 const FilePathParams = Type.Object({
   filePath: Type.String({ description: "Path to the source file to inspect." }),
@@ -90,6 +99,7 @@ const RenameParams = Type.Object({
 });
 
 export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): void {
+  registerToolPromptGuidelines(pi);
   pi.registerTool<typeof FilePathParams, unknown>({
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
