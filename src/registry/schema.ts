@@ -87,6 +87,7 @@ export interface LspConfig {
   warmup?: boolean;
   servers?: Record<string, Partial<ServerDefinition>>;
   trustedProjects?: string[];
+  extraWorkspaceRoots?: string[];
 }
 
 export interface InstalledServerMetadata {

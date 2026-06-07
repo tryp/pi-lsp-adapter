@@ -1,24 +1,39 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { delay } from "../util/helpers.js";
 import type {
+  CallHierarchyIncomingCall,
+  CallHierarchyItem,
+  CallHierarchyOutgoingCall,
+  CodeAction,
+  Command,
   Definition,
   DocumentSymbol,
   Hover,
   Location,
   LocationLink,
   SymbolInformation,
+  WorkspaceEdit,
   WorkspaceSymbol,
 } from "vscode-languageserver-protocol";
+import { URI } from "vscode-uri";
 import { detectFiletype } from "../detect/filetypes.js";
 import { detectRoot } from "../detect/root.js";
 import type { LoadLspConfigResult } from "../config/loadConfig.js";
 import type { LspInstallManager } from "../install/manager.js";
 import { readLockfile, type LockfileOptions } from "../install/lockfile.js";
-import type { InstalledServerMetadata, ServerDefinition } from "../registry/schema.js";
+import type {
+  InstalledServerMetadata,
+  ServerDefinition,
+} from "../registry/schema.js";
 import { resolveServerConfig } from "../resolve/resolveServer.js";
 import type { LspProcessRegistry } from "./processRegistry.js";
-import { LspClient, type LspConnectionFactory, type LspDiagnosticsResult, type LspServerSpawner } from "./client.js";
+import {
+  LspClient,
+  type LspConnectionFactory,
+  type LspDiagnosticsResult,
+  type LspServerSpawner,
+} from "./client.js";
 
 export interface LspRuntimeManagerOptions {
   cwd: string;
@@ -32,9 +47,15 @@ export interface LspRuntimeManagerOptions {
   requestTimeoutMs?: number;
   diagnosticsWaitMs?: number;
   shutdownGraceMs?: number;
+  extraWorkspaceRoots?: string[];
 }
 
-export type LspStartStatus = "started" | "already-running" | "missing" | "declined" | "error";
+export type LspStartStatus =
+  | "started"
+  | "already-running"
+  | "missing"
+  | "declined"
+  | "error";
 
 export interface LspStartResult {
   serverId: string;
@@ -106,7 +127,8 @@ export class LspRuntimeError extends Error {
       | "declined"
       | "start-failed"
       | "outside-workspace"
-      | "invalid-position",
+      | "invalid-position"
+      | "add-workspace-root-error",
   ) {
     super(message);
     this.name = "LspRuntimeError";
@@ -115,6 +137,8 @@ export class LspRuntimeError extends Error {
 
 export class LspRuntimeManager {
   private readonly cwd: string;
+  private readonly extraWorkspaceRoots: string[];
+  private workspaceRoots: string[];
   private readonly ownerId: string;
   private readonly config: LoadLspConfigResult;
   private readonly installManager: LspInstallManager;
@@ -131,6 +155,11 @@ export class LspRuntimeManager {
 
   constructor(options: LspRuntimeManagerOptions) {
     this.cwd = options.cwd;
+    this.extraWorkspaceRoots = options.extraWorkspaceRoots ?? [];
+    this.workspaceRoots = [
+      this.cwd,
+      ...this.extraWorkspaceRoots.map((r) => resolve(r)),
+    ];
     this.ownerId = options.ownerId;
     this.config = options.config;
     this.installManager = options.installManager;
@@ -161,12 +190,18 @@ export class LspRuntimeManager {
     serverId?: string,
     options: ClientStartOptions = { allowPromptInstall: false },
   ): Promise<LspStartResult[]> {
-    const targetIds = new Set(serverId ? [serverId] : [...this.clients.values()].map((client) => client.serverId));
+    const targetIds = new Set(
+      serverId
+        ? [serverId]
+        : [...this.clients.values()].map((client) => client.serverId),
+    );
     if (!serverId && targetIds.size === 0) {
       return this.startServer(undefined, options);
     }
 
-    const stopped = await this.shutdownClients((client) => targetIds.has(client.serverId));
+    const stopped = await this.shutdownClients((client) =>
+      targetIds.has(client.serverId),
+    );
     const failed = stopped.filter((entry) => !entry.stopped);
     if (failed.length > 0) {
       return failed.map(({ client }) => ({
@@ -180,13 +215,64 @@ export class LspRuntimeManager {
     return this.startServer(serverId, options);
   }
 
+  /**
+   * Add a directory to the LSP workspace roots so files under it can be
+   * inspected with LSP tools. Does not start a server immediately — servers
+   * are started lazily when a file from the new root is first queried.
+   *
+   * Returns the resolved absolute path and whether it was newly added.
+   *
+   * Throws LspRuntimeError with code "add-workspace-root-error" if the path
+   * does not exist or is not a directory.
+   */
+  async addWorkspaceRoot(
+    dir: string,
+  ): Promise<{ resolved: string; added: boolean }> {
+    const resolved = resolve(dir);
+
+    if (this.isInsideAnyWorkspace(resolved)) {
+      return { resolved, added: false };
+    }
+
+    // Check the path exists and is a directory
+    try {
+      const stat = await import("node:fs/promises").then((m) =>
+        m.stat(resolved),
+      );
+      if (!stat.isDirectory()) {
+        throw new LspRuntimeError(
+          `Cannot add workspace root ${resolved}: path is not a directory.`,
+          "add-workspace-root-error",
+        );
+      }
+    } catch (error) {
+      if (error instanceof LspRuntimeError) throw error;
+      throw new LspRuntimeError(
+        `Cannot add workspace root ${resolved}: ${error instanceof Error ? error.message : String(error)}`,
+        "add-workspace-root-error",
+      );
+    }
+
+    this.workspaceRoots.push(resolved);
+    return { resolved, added: true };
+  }
+
+  /**
+   * List all active workspace roots currently in scope.
+   */
+  listWorkspaceRoots(): string[] {
+    return [...this.workspaceRoots];
+  }
+
   async shutdown(): Promise<void> {
     this.filetypeCache.clear();
     await this.shutdownClients(() => true);
   }
 
   async stopServer(serverId?: string): Promise<number> {
-    const stopped = await this.shutdownClients((client) => !serverId || client.serverId === serverId);
+    const stopped = await this.shutdownClients(
+      (client) => !serverId || client.serverId === serverId,
+    );
     return stopped.filter((entry) => entry.stopped).length;
   }
 
@@ -200,7 +286,11 @@ export class LspRuntimeManager {
         allowPromptInstall: false,
         allowAutoInstall: false,
       });
-      await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
+      await target.client.syncFile(
+        selected.filePath,
+        selected.filetype,
+        selected.text,
+      );
       return true;
     } catch {
       return false;
@@ -219,8 +309,177 @@ export class LspRuntimeManager {
     };
   }
 
-  async hover(filePath: string, line: number, character: number): Promise<LspRuntimeFileResult<Hover | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+  /**
+   * Runs diagnostics AND queries code actions at a generic position.
+   * Returns both so the caller can annotate each diagnostic with fix availability.
+   */
+  async diagnosticsWithFixes(
+    filePath: string,
+  ): Promise<{
+    diagnostics: LspDiagnosticsResult;
+    codeActions: LspRuntimeFileResult<(CodeAction | Command)[] | null>;
+    diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }>;
+  }> {
+    const diagResult = await this.diagnostics(filePath);
+
+    // Sort diagnostics consistently so indices align with formatDiagnostics output
+    const allDiags = [...diagResult.diagnostics].sort(compareRawDiagnostics);
+
+    if (allDiags.length === 0) {
+      return {
+        diagnostics: diagResult,
+        codeActions: await this.codeAction(filePath, 1, 1),
+        diagnosticActions: [],
+      };
+    }
+
+    // Query code actions at each diagnostic position with that diagnostic as context.
+    // This lets LSP servers return per-diagnostic scoped actions when they support it.
+    // When they return file-wide actions (e.g. ruff-lsp's source.fixAll),
+    // the empty diagnostics field means they cover all diagnostics.
+    const uniqueActions = new Map<string, CodeAction>();
+    let primaryServerId = "";
+    let primaryUri = "";
+    const diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }> = [];
+
+    // Collect per-diagnostic actions by querying at each position
+    for (let i = 0; i < allDiags.length && i < 10; i++) {
+      const d = allDiags[i];
+      const line = d.range.start.line + 1;
+      const col = d.range.start.character + 1;
+
+      let caResult: LspRuntimeFileResult<(CodeAction | Command)[] | null>;
+      try {
+        caResult = await this.codeAction(filePath, line, col, [d]);
+      } catch {
+        continue;
+      }
+      const actions = caResult.result ?? [];
+
+      if (!primaryServerId) {
+        primaryServerId = caResult.serverId;
+        primaryUri = caResult.uri;
+      }
+
+      const titles: string[] = [];
+      for (const action of actions) {
+        if ("title" in action && !("command" in action)) {
+          const ca = action as CodeAction;
+          const actionDiags = ca.diagnostics ?? [];
+          const matches =
+            actionDiags.length === 0 ||
+            actionDiags.some(
+              (ad) =>
+                ad.message === d.message &&
+                ad.range.start.line === d.range.start.line &&
+                ad.range.start.character === d.range.start.character,
+            );
+          if (matches && !uniqueActions.has(ca.title)) {
+            uniqueActions.set(ca.title, ca);
+          }
+          if (matches) {
+            titles.push(ca.title);
+          }
+        }
+      }
+      diagnosticActions.push({ diagnosticIndex: i, actionTitles: titles });
+    }
+
+    // Always also try generic position to catch file-wide actions
+    // that may not appear at every diagnostic position.
+    let genericActions: (CodeAction | Command)[] = [];
+    try {
+      const genericResult = await this.codeAction(filePath, 1, 1);
+      genericActions = genericResult.result ?? [];
+      if (!primaryServerId) {
+        primaryServerId = genericResult.serverId;
+        primaryUri = genericResult.uri;
+      }
+    } catch {
+      // ignore
+    }
+    // Collect any file-wide actions (those with no per-diagnostic scope)
+    const fileWideTitles: string[] = [];
+    for (const action of genericActions) {
+      if ("title" in action && !("command" in action)) {
+        const ca = action as CodeAction;
+        if (!uniqueActions.has(ca.title)) {
+          uniqueActions.set(ca.title, ca);
+        }
+        // Actions with no diagnostics field are file-wide; they cover everything
+        if ((ca.diagnostics ?? []).length === 0) {
+          if (!fileWideTitles.includes(ca.title)) {
+            fileWideTitles.push(ca.title);
+          }
+        }
+      }
+    }
+
+    // Apply file-wide actions to any diagnostics that don't have specific actions yet
+    if (fileWideTitles.length > 0) {
+      for (let i = 0; i < allDiags.length; i++) {
+        const existing = diagnosticActions.find((da) => da.diagnosticIndex === i);
+        if (existing && existing.actionTitles.length === 0) {
+          existing.actionTitles.push(...fileWideTitles);
+        } else if (!existing) {
+          diagnosticActions.push({
+            diagnosticIndex: i,
+            actionTitles: [...fileWideTitles],
+          });
+        }
+      }
+      // Also ensure warnings without their own actions get covered
+      for (const action of genericActions) {
+        if ("title" in action && !("command" in action)) {
+          const ca = action as CodeAction;
+          if (ca.diagnostics && ca.diagnostics.length > 0) {
+            // Per-diagnostic scoped actions: match by position
+            for (let i = 0; i < allDiags.length; i++) {
+              const d = allDiags[i];
+              const matched = ca.diagnostics.some(
+                (ad) =>
+                  ad.message === d.message &&
+                  ad.range.start.line === d.range.start.line,
+              );
+              if (matched) {
+                const existing = diagnosticActions.find((da) => da.diagnosticIndex === i);
+                if (existing) {
+                  if (!existing.actionTitles.includes(ca.title)) {
+                    existing.actionTitles.push(ca.title);
+                  }
+                } else {
+                  diagnosticActions.push({ diagnosticIndex: i, actionTitles: [ca.title] });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      diagnostics: diagResult,
+      codeActions: {
+        serverId: primaryServerId,
+        rootDir: diagResult.rootDir,
+        filePath: diagResult.filePath,
+        uri: primaryUri,
+        result: Array.from(uniqueActions.values()),
+      },
+      diagnosticActions,
+    };
+  }
+
+  async hover(
+    filePath: string,
+    line: number,
+    character: number,
+  ): Promise<LspRuntimeFileResult<Hover | null>> {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -235,7 +494,11 @@ export class LspRuntimeManager {
     line: number,
     character: number,
   ): Promise<LspRuntimeFileResult<Definition | LocationLink[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -251,19 +514,30 @@ export class LspRuntimeManager {
     character: number,
     includeDeclaration = false,
   ): Promise<LspRuntimeFileResult<Location[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
       filePath: target.filePath,
       uri: target.uri,
-      result: await target.client.references(target.uri, line, character, includeDeclaration),
+      result: await target.client.references(
+        target.uri,
+        line,
+        character,
+        includeDeclaration,
+      ),
     };
   }
 
   async documentSymbols(
     filePath: string,
-  ): Promise<LspRuntimeFileResult<DocumentSymbol[] | SymbolInformation[] | null>> {
+  ): Promise<
+    LspRuntimeFileResult<DocumentSymbol[] | SymbolInformation[] | null>
+  > {
     const target = await this.prepareFileTarget(filePath);
     return {
       serverId: target.client.serverId,
@@ -271,6 +545,262 @@ export class LspRuntimeManager {
       filePath: target.filePath,
       uri: target.uri,
       result: await target.client.documentSymbols(target.uri),
+    };
+  }
+
+  async codeAction(
+    filePath: string,
+    line: number,
+    character: number,
+    diagnostics?: Diagnostic[],
+  ): Promise<LspRuntimeFileResult<(CodeAction | Command)[] | null>> {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
+    const context = diagnostics ? { diagnostics } : undefined;
+    let result = await target.client.codeAction(target.uri, line, character, context);
+    let serverId = target.client.serverId;
+    let rootDir = target.client.rootDir;
+
+    // If the primary server returned no code actions, try a fallback server
+    // for the same filetype (e.g. ruff for lint auto-fixes when pyright
+    // returns empty).
+    if (!result || result.length === 0) {
+      const fallback = this.findFallbackCodeActionServer(
+        target.server,
+        target.filetype,
+      );
+      if (fallback) {
+        try {
+          const fbTarget = await this.attachClient({
+            server: fallback,
+            rootDir: target.rootDir,
+            rootMarker: undefined,
+            filetype: target.filetype,
+            filePath: target.filePath,
+            text: target.text,
+          });
+          const fbResult = await fbTarget.client.codeAction(
+            fbTarget.uri,
+            line,
+            character,
+            context,
+          );
+          if (fbResult && fbResult.length > 0) {
+            result = fbResult;
+            serverId = fbTarget.client.serverId;
+            rootDir = fbTarget.client.rootDir;
+          }
+        } catch {
+          // Fallback failed silently -- keep original empty result
+        }
+      }
+    }
+
+    return {
+      serverId,
+      rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result,
+    };
+  }
+
+  /**
+   * Queries code actions at the given position, finds the action matching
+   * `actionTitle`, extracts its WorkspaceEdit, and applies the text edits
+   * to disk. Returns a summary of what was changed.
+   */
+  async applyCodeAction(
+    filePath: string,
+    line: number,
+    character: number,
+    actionTitle: string,
+  ): Promise<{
+    serverId: string;
+    rootDir: string;
+    filePath: string;
+    actionTitle: string;
+    actionKind?: string;
+    changes: number;
+    files: string[];
+    error?: string;
+  }> {
+    const result = await this.codeAction(filePath, line, character);
+    const actions = result.result ?? [];
+
+    // Find the action by title (case-insensitive)
+    const match = actions.find(
+      (a): a is CodeAction =>
+        "title" in a &&
+        a.title.trim().toLowerCase() === actionTitle.trim().toLowerCase(),
+    );
+    if (!match) {
+      const available = actions
+        .map((a) => ("title" in a ? `"${a.title}"` : "(command)"))
+        .join(", ");
+      return {
+        serverId: result.serverId,
+        rootDir: result.rootDir,
+        filePath: result.filePath,
+        actionTitle,
+        changes: 0,
+        files: [],
+        error: `No action matching "${actionTitle}". Available: ${available}`,
+      };
+    }
+
+    const edit = match.edit;
+    if (!edit) {
+      return {
+        serverId: result.serverId,
+        rootDir: result.rootDir,
+        filePath: result.filePath,
+        actionTitle,
+        actionKind: match.kind,
+        changes: 0,
+        files: [],
+        error: `Action "${actionTitle}" has no associated WorkspaceEdit.`,
+      };
+    }
+
+    const fileSet = new Set<string>();
+    let totalChanges = 0;
+
+    // Apply changes (simple format: TextEdit[] per URI)
+    if (edit.changes) {
+      for (const [uri, textEdits] of Object.entries(edit.changes)) {
+        const fsPath = uriToFsPath(uri);
+        fileSet.add(fsPath);
+        totalChanges += (textEdits as Array<unknown>).length;
+        await applyTextEdits(fsPath, textEdits);
+      }
+    }
+
+    // Apply documentChanges (extended format: TextDocumentEdit)
+    if (edit.documentChanges) {
+      for (const dc of edit.documentChanges) {
+        if ("edits" in dc) {
+          const tde = dc as { textDocument: { uri: string }; edits: Array<{ range: { start: { line: number; character: number }; end: { line: number; character: number } }; newText: string }> };
+          const fsPath = uriToFsPath(tde.textDocument.uri);
+          fileSet.add(fsPath);
+          totalChanges += tde.edits.length;
+          await applyTextEdits(fsPath, tde.edits);
+        }
+        // CreateFile, RenameFile, DeleteFile are skipped (rare for code actions)
+      }
+    }
+
+    return {
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+      actionTitle,
+      actionKind: match.kind,
+      changes: totalChanges,
+      files: [...fileSet],
+    };
+  }
+
+  async rename(
+    filePath: string,
+    line: number,
+    character: number,
+    newName: string,
+  ): Promise<LspRuntimeFileResult<WorkspaceEdit | null>> {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result: await target.client.rename(target.uri, line, character, newName),
+    };
+  }
+
+  async implementation(
+    filePath: string,
+    line: number,
+    character: number,
+  ): Promise<LspRuntimeFileResult<Location | LocationLink[] | null>> {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result: await target.client.implementation(target.uri, line, character),
+    };
+  }
+
+  async typeDefinition(
+    filePath: string,
+    line: number,
+    character: number,
+  ): Promise<LspRuntimeFileResult<Location | LocationLink[] | null>> {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result: await target.client.typeDefinition(target.uri, line, character),
+    };
+  }
+
+  async callHierarchy(
+    filePath: string,
+    line: number,
+    character: number,
+    direction: "incoming" | "outgoing",
+  ): Promise<
+    LspRuntimeFileResult<
+      CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null
+    >
+  > {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
+    const items = await target.client.prepareCallHierarchy(
+      target.uri,
+      line,
+      character,
+    );
+    if (!items || items.length === 0) {
+      return {
+        serverId: target.client.serverId,
+        rootDir: target.client.rootDir,
+        filePath: target.filePath,
+        uri: target.uri,
+        result: null,
+      };
+    }
+    const result =
+      direction === "incoming"
+        ? await target.client.callHierarchyIncomingCalls(items[0])
+        : await target.client.callHierarchyOutgoingCalls(items[0]);
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result,
     };
   }
 
@@ -302,7 +832,12 @@ export class LspRuntimeManager {
   activeClients(): Array<{ id: string; serverId: string; rootDir: string }> {
     const active: Array<{ id: string; serverId: string; rootDir: string }> = [];
     for (const client of this.clients.values()) {
-      if (!client.isExited) active.push({ id: client.id, serverId: client.serverId, rootDir: client.rootDir });
+      if (!client.isExited)
+        active.push({
+          id: client.id,
+          serverId: client.serverId,
+          rootDir: client.rootDir,
+        });
     }
     return active;
   }
@@ -310,12 +845,20 @@ export class LspRuntimeManager {
   private workspaceSymbolClients(): ClientTarget[] {
     const active: ClientTarget[] = [];
     for (const client of this.clients.values()) {
-      if (!client.isExited) active.push({ client, serverId: client.serverId, rootDir: client.rootDir, started: false });
+      if (!client.isExited)
+        active.push({
+          client,
+          serverId: client.serverId,
+          rootDir: client.rootDir,
+          started: false,
+        });
     }
     return active;
   }
 
-  private async prepareFileTarget(filePath: string): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  private async prepareFileTarget(
+    filePath: string,
+  ): Promise<SelectedServer & { client: LspClient; uri: string }> {
     const selected = await this.selectServerForFile(filePath);
     return this.attachClient(selected);
   }
@@ -330,14 +873,20 @@ export class LspRuntimeManager {
     return this.attachClient(selected);
   }
 
-  private async attachClient(selected: SelectedServer): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  private async attachClient(
+    selected: SelectedServer,
+  ): Promise<SelectedServer & { client: LspClient; uri: string }> {
     const target = await this.ensureClient({
       server: selected.server,
       rootDir: selected.rootDir,
       rootMarker: selected.rootMarker,
       allowPromptInstall: false,
     });
-    const uri = await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
+    const uri = await target.client.syncFile(
+      selected.filePath,
+      selected.filetype,
+      selected.text,
+    );
     return { ...selected, client: target.client, uri };
   }
 
@@ -345,15 +894,21 @@ export class LspRuntimeManager {
     const resolvedPath = this.resolvePath(filePath);
     const text = await readFile(resolvedPath, "utf8");
     const cached = this.filetypeCache.get(resolvedPath);
-    const filetype = cached ?? detectFiletype({ path: resolvedPath, content: text });
+    const filetype =
+      cached ?? detectFiletype({ path: resolvedPath, content: text });
     if (cached === undefined) {
       if (filetype) this.filetypeCache.set(resolvedPath, filetype);
     }
     if (!filetype) {
-      throw new LspRuntimeError(`No LSP filetype detected for ${resolvedPath}.`, "no-filetype");
+      throw new LspRuntimeError(
+        `No LSP filetype detected for ${resolvedPath}.`,
+        "no-filetype",
+      );
     }
 
-    const server = Object.values(this.config.catalog.servers).find((entry) => entry.filetypes.includes(filetype));
+    const server = Object.values(this.config.catalog.servers).find((entry) =>
+      entry.filetypes.includes(filetype),
+    );
     if (!server) {
       throw new LspRuntimeError(
         `No configured LSP server handles filetype ${filetype} for ${resolvedPath}.`,
@@ -362,7 +917,8 @@ export class LspRuntimeManager {
     }
 
     const root = await detectRoot(resolvedPath, server.rootMarkers);
-    const rootDir = root && isPathInside(this.cwd, root.rootDir) ? root.rootDir : this.cwd;
+    const rootDir =
+      root && this.isInsideAnyWorkspace(root.rootDir) ? root.rootDir : this.cwd;
     return {
       server,
       rootDir,
@@ -393,7 +949,10 @@ export class LspRuntimeManager {
           : `${serverId} is already running for ${target.rootDir}.`,
       };
     } catch (error) {
-      if (error instanceof LspRuntimeError && (error.code === "not-installed" || error.code === "declined")) {
+      if (
+        error instanceof LspRuntimeError &&
+        (error.code === "not-installed" || error.code === "declined")
+      ) {
         return {
           serverId,
           rootDir,
@@ -401,14 +960,40 @@ export class LspRuntimeManager {
           message: error.message,
         };
       }
-      return { serverId, rootDir, status: "error", message: error instanceof Error ? error.message : String(error) };
+      return {
+        serverId,
+        rootDir,
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
   private getServer(serverId: string): ServerDefinition {
     const server = this.config.catalog.servers[serverId];
-    if (!server) throw new LspRuntimeError(`Unknown LSP server: ${serverId}.`, "no-server");
+    if (!server)
+      throw new LspRuntimeError(
+        `Unknown LSP server: ${serverId}.`,
+        "no-server",
+      );
     return server;
+  }
+
+  /**
+   * Find a fallback server for code actions when the primary server returns
+   * empty results. Uses the first configured server that handles the same
+   * filetype but is not the current server (e.g. ruff for Python lint fixes
+   * when pyright returns no code actions).
+   */
+  private findFallbackCodeActionServer(
+    currentServer: ServerDefinition,
+    filetype: string,
+  ): ServerDefinition | undefined {
+    return Object.values(this.config.catalog.servers).find(
+      (entry) =>
+        entry.id !== currentServer.id &&
+        entry.filetypes.includes(filetype),
+    );
   }
 
   private async ensureClient(input: EnsureClientInput): Promise<ClientTarget> {
@@ -457,7 +1042,12 @@ export class LspRuntimeManager {
       });
       await client.start();
       this.clients.set(input.key, client);
-      return { client, serverId: input.server.id, rootDir: input.rootDir, started: true };
+      return {
+        client,
+        serverId: input.server.id,
+        rootDir: input.rootDir,
+        started: true,
+      };
     } catch (error) {
       await client?.shutdown().catch(() => false);
       throw new LspRuntimeError(
@@ -467,12 +1057,19 @@ export class LspRuntimeManager {
     }
   }
 
-  private async ensureInstalled(serverId: string, options: ClientStartOptions): Promise<InstalledServerMetadata> {
+  private async ensureInstalled(
+    serverId: string,
+    options: ClientStartOptions,
+  ): Promise<InstalledServerMetadata> {
     const lockfile = await readLockfile(this.lockfileOptions);
     const existing = lockfile.servers[serverId];
     if (existing) return existing;
 
-    if (!options.allowPromptInstall && (!(options.allowAutoInstall ?? true) || this.config.installMode !== "auto")) {
+    if (
+      !options.allowPromptInstall &&
+      (!(options.allowAutoInstall ?? true) ||
+        this.config.installMode !== "auto")
+    ) {
       throw new LspRuntimeError(
         `${serverId} is not installed. Run /lsp install ${serverId} to install it explicitly.`,
         "not-installed",
@@ -481,16 +1078,25 @@ export class LspRuntimeManager {
 
     const result = await this.installManager.ensureInstalled(serverId);
     if (result.status === "installed") return result.metadata;
-    throw new LspRuntimeError(result.message, result.status === "declined" ? "declined" : "not-installed");
+    throw new LspRuntimeError(
+      result.message,
+      result.status === "declined" ? "declined" : "not-installed",
+    );
   }
 
   private async installedServerIds(): Promise<string[]> {
     const lockfile = await readLockfile(this.lockfileOptions);
-    return Object.keys(lockfile.servers).filter((serverId) => this.config.catalog.servers[serverId] !== undefined);
+    return Object.keys(lockfile.servers).filter(
+      (serverId) => this.config.catalog.servers[serverId] !== undefined,
+    );
   }
 
-  private async shutdownClients(predicate: (client: LspClient) => boolean): Promise<ClientShutdownResult[]> {
-    const entries = [...this.clients.entries()].filter(([_key, client]) => predicate(client));
+  private async shutdownClients(
+    predicate: (client: LspClient) => boolean,
+  ): Promise<ClientShutdownResult[]> {
+    const entries = [...this.clients.entries()].filter(([_key, client]) =>
+      predicate(client),
+    );
     const stopped = await Promise.all(
       entries.map(async ([key, client]) => {
         const didStop = await client.shutdown();
@@ -502,14 +1108,20 @@ export class LspRuntimeManager {
   }
 
   private resolvePath(filePath: string): string {
-    const resolvedPath = isAbsolute(filePath) ? resolve(filePath) : resolve(this.cwd, filePath);
-    if (!isPathInside(this.cwd, resolvedPath)) {
+    const resolvedPath = isAbsolute(filePath)
+      ? resolve(filePath)
+      : resolve(this.cwd, filePath);
+    if (!this.isInsideAnyWorkspace(resolvedPath)) {
       throw new LspRuntimeError(
         `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd}.`,
         "outside-workspace",
       );
     }
     return resolvedPath;
+  }
+
+  private isInsideAnyWorkspace(targetPath: string): boolean {
+    return this.workspaceRoots.some((root) => isPathInside(root, targetPath));
   }
 }
 
@@ -519,12 +1131,24 @@ function clientKey(serverId: string, rootDir: string): string {
 
 function isPathInside(rootDir: string, targetPath: string): boolean {
   const relativePath = relative(resolve(rootDir), resolve(targetPath));
-  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !isAbsolute(relativePath))
+  );
 }
 
-function validatePosition(selected: SelectedServer, line: number, character: number): void {
+function validatePosition(
+  selected: SelectedServer,
+  line: number,
+  character: number,
+): void {
   const lines = splitLines(selected.text);
-  if (!Number.isInteger(line) || !Number.isInteger(character) || line < 0 || character < 0) {
+  if (
+    !Number.isInteger(line) ||
+    !Number.isInteger(character) ||
+    line < 0 ||
+    character < 0
+  ) {
     throw new LspRuntimeError(
       `Invalid LSP position for ${selected.filePath}. Use a valid 1-based line/column from the file and place the column on an identifier token.`,
       "invalid-position",
@@ -549,4 +1173,61 @@ function validatePosition(selected: SelectedServer, line: number, character: num
 
 function splitLines(text: string): string[] {
   return text.split(/\r\n|\r|\n/u);
+}
+
+/** Sort Diagnostic[] by severity (error first) then position. */
+function compareRawDiagnostics(a: Diagnostic, b: Diagnostic): number {
+  const sevA = a.severity ?? 4;
+  const sevB = b.severity ?? 4;
+  if (sevA !== sevB) return sevA - sevB;
+  const lineDiff = a.range.start.line - b.range.start.line;
+  if (lineDiff !== 0) return lineDiff;
+  return a.range.start.character - b.range.start.character;
+}
+
+function uriToFsPath(uri: string): string {
+  return URI.parse(uri).fsPath;
+}
+
+interface TextEditLike {
+  range: { start: { line: number; character: number }; end: { line: number; character: number } };
+  newText: string;
+}
+
+/**
+ * Applies a list of TextEdits to a file on disk.
+ * Edits are sorted in reverse order (by line, then character descending)
+ * so that earlier positions are not shifted by later edits.
+ */
+async function applyTextEdits(fsPath: string, edits: TextEditLike[]): Promise<void> {
+  const text = await readFile(fsPath, "utf8");
+  const lines = text.split("\n");
+
+  // Sort edits in reverse order so they don't interfere
+  const sorted = [...edits].sort((a, b) => {
+    const lineDiff = b.range.start.line - a.range.start.line;
+    if (lineDiff !== 0) return lineDiff;
+    return b.range.start.character - a.range.start.character;
+  });
+
+  for (const edit of sorted) {
+    const startLine = edit.range.start.line;
+    const startCol = edit.range.start.character;
+    const endLine = edit.range.end.line;
+    const endCol = edit.range.end.character;
+
+    if (startLine === endLine) {
+      // Single-line edit
+      const line = lines[startLine];
+      lines[startLine] = line.slice(0, startCol) + edit.newText + line.slice(endCol);
+    } else {
+      // Multi-line edit: replace range with newText
+      const firstPart = lines[startLine].slice(0, startCol);
+      const lastPart = lines[endLine].slice(endCol);
+      const middle = edit.newText;
+      lines.splice(startLine, endLine - startLine + 1, firstPart + middle + lastPart);
+    }
+  }
+
+  await writeFile(fsPath, lines.join("\n"), "utf8");
 }
