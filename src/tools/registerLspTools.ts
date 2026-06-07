@@ -4,11 +4,16 @@ import type { LspExtensionState } from "../state.js";
 import { setLspStatusLine } from "../statusLine.js";
 import {
   failure,
+  formatCallHierarchy,
+  formatCodeActions,
   formatDefinition,
   formatDiagnostics,
   formatDocumentSymbols,
   formatHover,
+  formatImplementations,
   formatReferences,
+  formatRenameEdit,
+  formatTypeDefinition,
   formatWorkspaceSymbols,
   toLspPosition,
 } from "./lspFormat.js";
@@ -53,6 +58,35 @@ const MoreParams = Type.Object({
     minLength: LSP_RESULT_ID_LENGTH,
     maxLength: LSP_RESULT_ID_LENGTH,
   }),
+});
+
+const CodeActionParams = Type.Object({
+  filePath: Type.String({ description: "Path to the source file to inspect." }),
+  line: Type.Integer({ minimum: 1, description: "1-based line number." }),
+  column: Type.Integer({
+    minimum: 1,
+    description: "1-based column/character number. Place it on the identifier or error token.",
+  }),
+});
+
+const CallHierarchyParams = Type.Object({
+  filePath: Type.String({ description: "Path to the source file to inspect." }),
+  line: Type.Integer({ minimum: 1, description: "1-based line number." }),
+  column: Type.Integer({
+    minimum: 1,
+    description: "1-based column/character number. Place it on the identifier token.",
+  }),
+  direction: Type.String({ description: "Direction of call hierarchy: 'incoming' or 'outgoing'." }),
+});
+
+const RenameParams = Type.Object({
+  filePath: Type.String({ description: "Path to the source file to inspect." }),
+  line: Type.Integer({ minimum: 1, description: "1-based line number of the symbol to rename." }),
+  column: Type.Integer({
+    minimum: 1,
+    description: "1-based column/character number. Place it on the symbol identifier to rename.",
+  }),
+  newName: Type.String({ description: "The new name for the symbol." }),
 });
 
 export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): void {
@@ -238,6 +272,160 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
       const state = getState();
       if (!state) return failure("lsp_more", "LSP extension is not initialized.");
       return state.resultCache.next(params.resultId);
+    },
+  });
+
+  pi.registerTool<typeof CodeActionParams, unknown>({
+    name: "lsp_code_action",
+    label: "LSP Code Action",
+    description:
+      "Get available code actions (quick fixes, refactors, source actions) at a source position. Returns actions like add import, fix lint, extract method, or organize imports.",
+    promptSnippet:
+      "Get available code actions (quick fixes, refactors, source actions) at a source position.",
+    promptGuidelines: [
+      "Use lsp_code_action after lsp_diagnostics returns errors — the LSP returns concrete actions like 'Add import X from Y', 'Remove unused variable foo', or 'Fix this lint error'.",
+      "Place the column on the identifier or error token where you want code actions.",
+      "Returns a list of available actions with their kinds and whether they're preferred. Each action shows its title, kind, and any associated diagnostics it addresses.",
+    ],
+    parameters: CodeActionParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getState();
+      if (!state) return failure("lsp_code_action", "LSP extension is not initialized.");
+      try {
+        const position = toLspPosition(params);
+        const result = formatCodeActions(
+          await state.runtimeManager.codeAction(params.filePath, position.line, position.character),
+          state.resultCache,
+        );
+        refreshStatus(ctx, state);
+        return result;
+      } catch (error) {
+        refreshStatus(ctx, state);
+        return failure("lsp_code_action", error);
+      }
+    },
+  });
+
+  pi.registerTool<typeof RenameParams, unknown>({
+    name: "lsp_rename",
+    label: "LSP Rename",
+    description:
+      "Rename a symbol across the entire workspace using language server intelligence. Provides a summary of all files and occurrences changed.",
+    promptSnippet:
+      "Rename a symbol across the workspace using the language server.",
+    promptGuidelines: [
+      "Use lsp_rename for safe workspace-wide renaming instead of manual grep-and-edit. One LSP call replaces references across all files.",
+      "Place the column on the symbol identifier to rename. Provide the new name as a string.",
+      "Returns a summary of files changed and occurrence count. Currently returns the edit summary for review — direct file application is a future enhancement.",
+      "The rename will fail if the symbol is not renamable (e.g., language keywords, built-in names). Call lsp_definition first to verify the symbol exists.",
+    ],
+    parameters: RenameParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getState();
+      if (!state) return failure("lsp_rename", "LSP extension is not initialized.");
+      try {
+        const position = toLspPosition(params);
+        const result = formatRenameEdit(
+          await state.runtimeManager.rename(params.filePath, position.line, position.character, params.newName),
+        );
+        refreshStatus(ctx, state);
+        return result;
+      } catch (error) {
+        refreshStatus(ctx, state);
+        return failure("lsp_rename", error);
+      }
+    },
+  });
+
+  pi.registerTool<typeof FilePositionParams, unknown>({
+    name: "lsp_implementation",
+    label: "LSP Implementation",
+    description:
+      "Find implementation locations for the symbol at a source position. Navigates from an interface or abstract method to concrete implementations.",
+    promptSnippet:
+      "Find implementations for a symbol at a 1-based line and column.",
+    promptGuidelines: [
+      "Use lsp_implementation to navigate from an interface or abstract method to its concrete implementations.",
+      "Returns file:line:column targets for each implementation.",
+    ],
+    parameters: FilePositionParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getState();
+      if (!state) return failure("lsp_implementation", "LSP extension is not initialized.");
+      try {
+        const position = toLspPosition(params);
+        const result = formatImplementations(
+          await state.runtimeManager.implementation(params.filePath, position.line, position.character),
+          state.resultCache,
+        );
+        refreshStatus(ctx, state);
+        return result;
+      } catch (error) {
+        refreshStatus(ctx, state);
+        return failure("lsp_implementation", error);
+      }
+    },
+  });
+
+  pi.registerTool<typeof FilePositionParams, unknown>({
+    name: "lsp_type_definition",
+    label: "LSP Type Definition",
+    description:
+      "Find type definition locations for the symbol at a source position. Goes from a value to its type definition (e.g., from a variable to its type's definition).",
+    promptSnippet:
+      "Find type definition for a symbol at a 1-based line and column.",
+    promptGuidelines: [
+      "Use lsp_type_definition to go from a value to its type definition. In TypeScript, at a variable declaration this navigates to the type's definition, not the variable's.",
+      "Returns a single file:line:column target.",
+    ],
+    parameters: FilePositionParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getState();
+      if (!state) return failure("lsp_type_definition", "LSP extension is not initialized.");
+      try {
+        const position = toLspPosition(params);
+        const result = formatTypeDefinition(
+          await state.runtimeManager.typeDefinition(params.filePath, position.line, position.character),
+          state.resultCache,
+        );
+        refreshStatus(ctx, state);
+        return result;
+      } catch (error) {
+        refreshStatus(ctx, state);
+        return failure("lsp_type_definition", error);
+      }
+    },
+  });
+
+  pi.registerTool<typeof CallHierarchyParams, unknown>({
+    name: "lsp_call_hierarchy",
+    label: "LSP Call Hierarchy",
+    description:
+      "Show call hierarchy for the symbol at a source position. Use 'incoming' to see what calls this symbol, or 'outgoing' to see what this symbol calls.",
+    promptSnippet:
+      "Show call hierarchy (incoming/outgoing) for a symbol at a 1-based line and column.",
+    promptGuidelines: [
+      "Use lsp_call_hierarchy for impact analysis before refactoring.",
+      "Set direction to 'incoming' to see what calls this function, or 'outgoing' to see what this function calls.",
+      "Returns call hierarchy items with file:line:column locations.",
+    ],
+    parameters: CallHierarchyParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getState();
+      if (!state) return failure("lsp_call_hierarchy", "LSP extension is not initialized.");
+      try {
+        const position = toLspPosition(params);
+        const result = formatCallHierarchy(
+          await state.runtimeManager.callHierarchy(params.filePath, position.line, position.character, params.direction),
+          params.direction,
+          state.resultCache,
+        );
+        refreshStatus(ctx, state);
+        return result;
+      } catch (error) {
+        refreshStatus(ctx, state);
+        return failure("lsp_call_hierarchy", error);
+      }
     },
   });
 }

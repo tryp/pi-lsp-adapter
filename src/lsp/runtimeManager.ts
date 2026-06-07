@@ -2,12 +2,18 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { delay } from "../util/helpers.js";
 import type {
+  CallHierarchyIncomingCall,
+  CallHierarchyItem,
+  CallHierarchyOutgoingCall,
+  CodeAction,
+  Command,
   Definition,
   DocumentSymbol,
   Hover,
   Location,
   LocationLink,
   SymbolInformation,
+  WorkspaceEdit,
   WorkspaceSymbol,
 } from "vscode-languageserver-protocol";
 import { detectFiletype } from "../detect/filetypes.js";
@@ -32,6 +38,7 @@ export interface LspRuntimeManagerOptions {
   requestTimeoutMs?: number;
   diagnosticsWaitMs?: number;
   shutdownGraceMs?: number;
+  extraWorkspaceRoots?: string[];
 }
 
 export type LspStartStatus = "started" | "already-running" | "missing" | "declined" | "error";
@@ -115,6 +122,8 @@ export class LspRuntimeError extends Error {
 
 export class LspRuntimeManager {
   private readonly cwd: string;
+  private readonly extraWorkspaceRoots: string[];
+  private readonly workspaceRoots: string[];
   private readonly ownerId: string;
   private readonly config: LoadLspConfigResult;
   private readonly installManager: LspInstallManager;
@@ -131,6 +140,8 @@ export class LspRuntimeManager {
 
   constructor(options: LspRuntimeManagerOptions) {
     this.cwd = options.cwd;
+    this.extraWorkspaceRoots = options.extraWorkspaceRoots ?? [];
+    this.workspaceRoots = [this.cwd, ...this.extraWorkspaceRoots.map((r) => resolve(r))];
     this.ownerId = options.ownerId;
     this.config = options.config;
     this.installManager = options.installManager;
@@ -274,6 +285,96 @@ export class LspRuntimeManager {
     };
   }
 
+  async codeAction(
+    filePath: string,
+    line: number,
+    character: number,
+  ): Promise<LspRuntimeFileResult<(CodeAction | Command)[] | null>> {
+    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result: await target.client.codeAction(target.uri, line, character),
+    };
+  }
+
+  async rename(
+    filePath: string,
+    line: number,
+    character: number,
+    newName: string,
+  ): Promise<LspRuntimeFileResult<WorkspaceEdit | null>> {
+    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result: await target.client.rename(target.uri, line, character, newName),
+    };
+  }
+
+  async implementation(
+    filePath: string,
+    line: number,
+    character: number,
+  ): Promise<LspRuntimeFileResult<Location | LocationLink[] | null>> {
+    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result: await target.client.implementation(target.uri, line, character),
+    };
+  }
+
+  async typeDefinition(
+    filePath: string,
+    line: number,
+    character: number,
+  ): Promise<LspRuntimeFileResult<Location | LocationLink[] | null>> {
+    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result: await target.client.typeDefinition(target.uri, line, character),
+    };
+  }
+
+  async callHierarchy(
+    filePath: string,
+    line: number,
+    character: number,
+    direction: "incoming" | "outgoing",
+  ): Promise<LspRuntimeFileResult<CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null>> {
+    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const items = await target.client.prepareCallHierarchy(target.uri, line, character);
+    if (!items || items.length === 0) {
+      return {
+        serverId: target.client.serverId,
+        rootDir: target.client.rootDir,
+        filePath: target.filePath,
+        uri: target.uri,
+        result: null,
+      };
+    }
+    const result = direction === "incoming"
+      ? await target.client.callHierarchyIncomingCalls(items[0])
+      : await target.client.callHierarchyOutgoingCalls(items[0]);
+    return {
+      serverId: target.client.serverId,
+      rootDir: target.client.rootDir,
+      filePath: target.filePath,
+      uri: target.uri,
+      result,
+    };
+  }
+
   async workspaceSymbols(
     query: string,
     serverId?: string,
@@ -362,7 +463,7 @@ export class LspRuntimeManager {
     }
 
     const root = await detectRoot(resolvedPath, server.rootMarkers);
-    const rootDir = root && isPathInside(this.cwd, root.rootDir) ? root.rootDir : this.cwd;
+    const rootDir = root && this.isInsideAnyWorkspace(root.rootDir) ? root.rootDir : this.cwd;
     return {
       server,
       rootDir,
@@ -503,13 +604,17 @@ export class LspRuntimeManager {
 
   private resolvePath(filePath: string): string {
     const resolvedPath = isAbsolute(filePath) ? resolve(filePath) : resolve(this.cwd, filePath);
-    if (!isPathInside(this.cwd, resolvedPath)) {
+    if (!this.isInsideAnyWorkspace(resolvedPath)) {
       throw new LspRuntimeError(
         `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd}.`,
         "outside-workspace",
       );
     }
     return resolvedPath;
+  }
+
+  private isInsideAnyWorkspace(targetPath: string): boolean {
+    return this.workspaceRoots.some((root) => isPathInside(root, targetPath));
   }
 }
 

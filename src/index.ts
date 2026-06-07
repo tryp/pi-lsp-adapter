@@ -59,6 +59,7 @@ Recommended workflow for code understanding without read: (1) lsp_document_symbo
         config,
         installManager,
         processRegistry,
+        extraWorkspaceRoots: config.extraWorkspaceRoots,
       });
       const resultCache = new LspResultCache();
 

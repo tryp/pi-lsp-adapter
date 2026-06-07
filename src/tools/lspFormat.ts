@@ -1,4 +1,9 @@
 import type {
+  CallHierarchyIncomingCall,
+  CallHierarchyItem,
+  CallHierarchyOutgoingCall,
+  CodeAction,
+  Command,
   Definition,
   Diagnostic,
   DocumentSymbol,
@@ -8,6 +13,7 @@ import type {
   MarkupContent,
   Range,
   SymbolInformation,
+  WorkspaceEdit,
   WorkspaceSymbol,
 } from "vscode-languageserver-protocol";
 import { URI } from "vscode-uri";
@@ -219,6 +225,164 @@ export function formatWorkspaceSymbols(
   });
 }
 
+export interface NormalizedCallHierarchyItem {
+  name: string;
+  kind: string;
+  detail?: string;
+  filePath?: string;
+  range?: DisplayRange;
+  depth?: number;
+}
+
+export interface NormalizedCodeAction {
+  title: string;
+  kind?: string;
+  diagnostics?: string[];
+  isPreferred?: boolean;
+  edit?: { changes: number; files: string[] };
+}
+
+export function formatCodeActions(
+  result: LspRuntimeFileResult<(CodeAction | Command)[] | null>,
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<NormalizedCodeAction>> {
+  const actions = normalizeCodeActions(result.result ?? []);
+  return paginateItems({
+    kind: "code_actions",
+    title: `LSP code actions for ${result.filePath} (${result.serverId}):`,
+    emptyText: `No LSP code actions for ${result.filePath}.`,
+    items: actions,
+    pageSize: options.pageSize ?? 50,
+    cache,
+    baseDetails: {
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+    },
+    formatItem: (action) => {
+      const parts: string[] = [];
+      if (action.isPreferred) parts.push("*");
+      parts.push(action.title);
+      if (action.kind) parts.push(`[${action.kind}]`);
+      if (action.edit) parts.push(`(edits ${action.edit.changes} location(s) across ${action.edit.files.length} file(s))`);
+      if (action.diagnostics && action.diagnostics.length > 0) {
+        for (const d of action.diagnostics) parts.push(`\n    diagnostic: ${d}`);
+      }
+      return `- ${parts.join(" ")}`;
+    },
+  });
+}
+
+export function formatRenameEdit(
+  result: LspRuntimeFileResult<WorkspaceEdit | null>,
+): LspToolResult<{ ok: boolean; serverId: string; rootDir: string; filePath: string; summary?: string; changes?: number; files?: string[]; error?: string }> {
+  if (!result.result) {
+    return success(`LSP rename for ${result.filePath} (${result.serverId}): No rename result.`, {
+      ok: true,
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+    });
+  }
+
+  const edit = result.result;
+  const changes = edit.changes ?? {};
+  const documentChanges = edit.documentChanges ?? [];
+  const fileUris = new Set([...Object.keys(changes), ...documentChanges.map((dc) => ("textDocument" in dc ? dc.textDocument.uri : ""))].filter(Boolean));
+  const totalChanges = Object.values(changes).reduce((sum, edits) => sum + edits.length, 0) +
+    documentChanges.reduce((sum, dc) => sum + ("edits" in dc ? dc.edits.length : 0), 0);
+
+  const fileList = [...fileUris].map((u) => {
+    try { return URI.parse(u).fsPath; } catch { return u; }
+  });
+  const lineCount = totalChanges;
+  const fileCount = fileList.length;
+
+  const lines = [
+    `LSP rename for ${result.filePath} (${result.serverId}):`,
+    `Renamed across ${fileCount} file(s) (${lineCount} occurrence(s)).`,
+    "",
+    "Files changed:",
+    ...fileList.map((f) => `- ${f}`),
+  ];
+
+  return success(lines.join("\n"), {
+    ok: true,
+    serverId: result.serverId,
+    rootDir: result.rootDir,
+    filePath: result.filePath,
+    summary: `Renamed across ${fileCount} file(s) (${lineCount} occurrence(s)).`,
+    changes: lineCount,
+    files: fileList,
+  });
+}
+
+export function formatImplementations(
+  result: LspRuntimeFileResult<Location | LocationLink[] | null>,
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<DisplayLocation>> {
+  const locations = normalizeDefinition(result.result).sort(compareLocations(result.filePath));
+  return formatPaginatedLocations("implementation", result, locations, cache, options.pageSize ?? 25);
+}
+
+export function formatTypeDefinition(
+  result: LspRuntimeFileResult<Location | LocationLink[] | null>,
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<DisplayLocation>> {
+  const locations = normalizeDefinition(result.result).sort(compareLocations(result.filePath));
+  return formatPaginatedLocations("type definition", result, locations, cache, options.pageSize ?? 25);
+}
+
+export function formatCallHierarchy(
+  result: LspRuntimeFileResult<CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null>,
+  direction: "incoming" | "outgoing",
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<NormalizedCallHierarchyItem>> {
+  const items = normalizeCallHierarchy(result.result, direction);
+  return paginateItems({
+    kind: "call_hierarchy",
+    title: `LSP call hierarchy (${direction}) for ${result.filePath} (${result.serverId}):`,
+    emptyText: `No LSP call hierarchy (${direction}) for ${result.filePath}.`,
+    items,
+    pageSize: options.pageSize ?? 50,
+    cache,
+    baseDetails: {
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+    },
+    formatItem: (item) => {
+      const indent = "  ".repeat(item.depth ?? 0);
+      const where = item.range ? ` ${formatRangeStart(item.range)}` : "";
+      const detail = item.detail ? ` — ${item.detail}` : "";
+      const path = item.filePath ? ` (${item.filePath}${where})` : where;
+      return `${indent}  ${direction === "incoming" ? "\u2190" : "\u2192"} ${item.name} (${item.kind})${detail}${path}`;
+    },
+  });
+}
+
+function normalizeCallHierarchy(
+  value: CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null,
+  direction: "incoming" | "outgoing",
+): NormalizedCallHierarchyItem[] {
+  if (!value) return [];
+  return value.map((call, index) => {
+    const item = direction === "incoming" ? (call as CallHierarchyIncomingCall).from : (call as CallHierarchyOutgoingCall).to;
+    return {
+      name: item.name,
+      kind: symbolKindName(item.kind),
+      detail: item.detail,
+      filePath: uriToFilePath(item.uri),
+      range: item.selectionRange ? displayRange(item.selectionRange) : undefined,
+      depth: 0,
+    };
+  });
+}
+
 function paginateItems<TItem>(input: {
   kind: string;
   title: string;
@@ -317,7 +481,7 @@ function chunk<T>(items: T[], size: number): T[][] {
 function normalizeDiagnostic(diagnostic: Diagnostic): NormalizedDiagnostic {
   return {
     severity: diagnosticSeverityName(diagnostic.severity),
-    message: diagnostic.message,
+    message: diagnosticMessageText(diagnostic.message),
     range: displayRange(diagnostic.range),
     ...(diagnostic.source ? { source: diagnostic.source } : {}),
     ...(diagnostic.code !== undefined ? { code: diagnostic.code } : {}),
@@ -379,6 +543,62 @@ function normalizeLocationLink(link: LocationLink): DisplayLocation {
 function normalizeWorkspaceSymbolLocation(location: WorkspaceSymbol["location"]): DisplayLocation {
   if ("range" in location) return normalizeLocation(location);
   return { uri: location.uri, filePath: uriToFilePath(location.uri) };
+}
+
+function diagnosticMessageText(message: string | MarkupContent): string {
+  return typeof message === "string" ? message : message.value;
+}
+
+function normalizeCodeActions(actions: (CodeAction | Command)[]): NormalizedCodeAction[] {
+  return actions.map((action) => {
+    if ("title" in action && !("command" in action)) {
+      // CodeAction object
+      const codeAction = action as CodeAction;
+      const edit = codeAction.edit
+        ? {
+            changes: countEditChanges(codeAction.edit),
+            files: collectEditFiles(codeAction.edit),
+          }
+        : undefined;
+      return {
+        title: codeAction.title,
+        kind: codeAction.kind,
+        isPreferred: codeAction.isPreferred,
+        edit,
+        diagnostics: codeAction.diagnostics?.map((d) => diagnosticMessageText(d.message)),
+      };
+    }
+    // Command object
+    return { title: action.title };
+  });
+}
+
+function countEditChanges(edit: WorkspaceEdit): number {
+  const changes = edit.changes ?? {};
+  const documentChanges = edit.documentChanges ?? [];
+  const textEditCount = Object.values(changes).reduce((sum, edits) => sum + edits.length, 0);
+  const documentChangeCount = documentChanges.reduce(
+    (sum, dc) => sum + ("edits" in dc ? dc.edits.length : 0),
+    0,
+  );
+  return textEditCount + documentChangeCount;
+}
+
+function collectEditFiles(edit: WorkspaceEdit): string[] {
+  const uris = new Set<string>();
+  for (const uri of Object.keys(edit.changes ?? {})) {
+    uris.add(uri);
+  }
+  for (const dc of edit.documentChanges ?? []) {
+    if ("textDocument" in dc) uris.add(dc.textDocument.uri);
+  }
+  return [...uris].map((u) => {
+    try {
+      return URI.parse(u).fsPath;
+    } catch {
+      return u;
+    }
+  });
 }
 
 function hoverToText(hover: Hover): string {
