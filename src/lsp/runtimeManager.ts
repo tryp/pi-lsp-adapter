@@ -21,10 +21,18 @@ import { detectRoot } from "../detect/root.js";
 import type { LoadLspConfigResult } from "../config/loadConfig.js";
 import type { LspInstallManager } from "../install/manager.js";
 import { readLockfile, type LockfileOptions } from "../install/lockfile.js";
-import type { InstalledServerMetadata, ServerDefinition } from "../registry/schema.js";
+import type {
+  InstalledServerMetadata,
+  ServerDefinition,
+} from "../registry/schema.js";
 import { resolveServerConfig } from "../resolve/resolveServer.js";
 import type { LspProcessRegistry } from "./processRegistry.js";
-import { LspClient, type LspConnectionFactory, type LspDiagnosticsResult, type LspServerSpawner } from "./client.js";
+import {
+  LspClient,
+  type LspConnectionFactory,
+  type LspDiagnosticsResult,
+  type LspServerSpawner,
+} from "./client.js";
 
 export interface LspRuntimeManagerOptions {
   cwd: string;
@@ -41,7 +49,12 @@ export interface LspRuntimeManagerOptions {
   extraWorkspaceRoots?: string[];
 }
 
-export type LspStartStatus = "started" | "already-running" | "missing" | "declined" | "error";
+export type LspStartStatus =
+  | "started"
+  | "already-running"
+  | "missing"
+  | "declined"
+  | "error";
 
 export interface LspStartResult {
   serverId: string;
@@ -113,7 +126,8 @@ export class LspRuntimeError extends Error {
       | "declined"
       | "start-failed"
       | "outside-workspace"
-      | "invalid-position",
+      | "invalid-position"
+      | "add-workspace-root-error",
   ) {
     super(message);
     this.name = "LspRuntimeError";
@@ -123,7 +137,7 @@ export class LspRuntimeError extends Error {
 export class LspRuntimeManager {
   private readonly cwd: string;
   private readonly extraWorkspaceRoots: string[];
-  private readonly workspaceRoots: string[];
+  private workspaceRoots: string[];
   private readonly ownerId: string;
   private readonly config: LoadLspConfigResult;
   private readonly installManager: LspInstallManager;
@@ -141,7 +155,10 @@ export class LspRuntimeManager {
   constructor(options: LspRuntimeManagerOptions) {
     this.cwd = options.cwd;
     this.extraWorkspaceRoots = options.extraWorkspaceRoots ?? [];
-    this.workspaceRoots = [this.cwd, ...this.extraWorkspaceRoots.map((r) => resolve(r))];
+    this.workspaceRoots = [
+      this.cwd,
+      ...this.extraWorkspaceRoots.map((r) => resolve(r)),
+    ];
     this.ownerId = options.ownerId;
     this.config = options.config;
     this.installManager = options.installManager;
@@ -172,12 +189,18 @@ export class LspRuntimeManager {
     serverId?: string,
     options: ClientStartOptions = { allowPromptInstall: false },
   ): Promise<LspStartResult[]> {
-    const targetIds = new Set(serverId ? [serverId] : [...this.clients.values()].map((client) => client.serverId));
+    const targetIds = new Set(
+      serverId
+        ? [serverId]
+        : [...this.clients.values()].map((client) => client.serverId),
+    );
     if (!serverId && targetIds.size === 0) {
       return this.startServer(undefined, options);
     }
 
-    const stopped = await this.shutdownClients((client) => targetIds.has(client.serverId));
+    const stopped = await this.shutdownClients((client) =>
+      targetIds.has(client.serverId),
+    );
     const failed = stopped.filter((entry) => !entry.stopped);
     if (failed.length > 0) {
       return failed.map(({ client }) => ({
@@ -191,13 +214,64 @@ export class LspRuntimeManager {
     return this.startServer(serverId, options);
   }
 
+  /**
+   * Add a directory to the LSP workspace roots so files under it can be
+   * inspected with LSP tools. Does not start a server immediately — servers
+   * are started lazily when a file from the new root is first queried.
+   *
+   * Returns the resolved absolute path and whether it was newly added.
+   *
+   * Throws LspRuntimeError with code "add-workspace-root-error" if the path
+   * does not exist or is not a directory.
+   */
+  async addWorkspaceRoot(
+    dir: string,
+  ): Promise<{ resolved: string; added: boolean }> {
+    const resolved = resolve(dir);
+
+    if (this.isInsideAnyWorkspace(resolved)) {
+      return { resolved, added: false };
+    }
+
+    // Check the path exists and is a directory
+    try {
+      const stat = await import("node:fs/promises").then((m) =>
+        m.stat(resolved),
+      );
+      if (!stat.isDirectory()) {
+        throw new LspRuntimeError(
+          `Cannot add workspace root ${resolved}: path is not a directory.`,
+          "add-workspace-root-error",
+        );
+      }
+    } catch (error) {
+      if (error instanceof LspRuntimeError) throw error;
+      throw new LspRuntimeError(
+        `Cannot add workspace root ${resolved}: ${error instanceof Error ? error.message : String(error)}`,
+        "add-workspace-root-error",
+      );
+    }
+
+    this.workspaceRoots.push(resolved);
+    return { resolved, added: true };
+  }
+
+  /**
+   * List all active workspace roots currently in scope.
+   */
+  listWorkspaceRoots(): string[] {
+    return [...this.workspaceRoots];
+  }
+
   async shutdown(): Promise<void> {
     this.filetypeCache.clear();
     await this.shutdownClients(() => true);
   }
 
   async stopServer(serverId?: string): Promise<number> {
-    const stopped = await this.shutdownClients((client) => !serverId || client.serverId === serverId);
+    const stopped = await this.shutdownClients(
+      (client) => !serverId || client.serverId === serverId,
+    );
     return stopped.filter((entry) => entry.stopped).length;
   }
 
@@ -211,7 +285,11 @@ export class LspRuntimeManager {
         allowPromptInstall: false,
         allowAutoInstall: false,
       });
-      await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
+      await target.client.syncFile(
+        selected.filePath,
+        selected.filetype,
+        selected.text,
+      );
       return true;
     } catch {
       return false;
@@ -230,8 +308,16 @@ export class LspRuntimeManager {
     };
   }
 
-  async hover(filePath: string, line: number, character: number): Promise<LspRuntimeFileResult<Hover | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+  async hover(
+    filePath: string,
+    line: number,
+    character: number,
+  ): Promise<LspRuntimeFileResult<Hover | null>> {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -246,7 +332,11 @@ export class LspRuntimeManager {
     line: number,
     character: number,
   ): Promise<LspRuntimeFileResult<Definition | LocationLink[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -262,19 +352,30 @@ export class LspRuntimeManager {
     character: number,
     includeDeclaration = false,
   ): Promise<LspRuntimeFileResult<Location[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
       filePath: target.filePath,
       uri: target.uri,
-      result: await target.client.references(target.uri, line, character, includeDeclaration),
+      result: await target.client.references(
+        target.uri,
+        line,
+        character,
+        includeDeclaration,
+      ),
     };
   }
 
   async documentSymbols(
     filePath: string,
-  ): Promise<LspRuntimeFileResult<DocumentSymbol[] | SymbolInformation[] | null>> {
+  ): Promise<
+    LspRuntimeFileResult<DocumentSymbol[] | SymbolInformation[] | null>
+  > {
     const target = await this.prepareFileTarget(filePath);
     return {
       serverId: target.client.serverId,
@@ -290,7 +391,11 @@ export class LspRuntimeManager {
     line: number,
     character: number,
   ): Promise<LspRuntimeFileResult<(CodeAction | Command)[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -306,7 +411,11 @@ export class LspRuntimeManager {
     character: number,
     newName: string,
   ): Promise<LspRuntimeFileResult<WorkspaceEdit | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -321,7 +430,11 @@ export class LspRuntimeManager {
     line: number,
     character: number,
   ): Promise<LspRuntimeFileResult<Location | LocationLink[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -336,7 +449,11 @@ export class LspRuntimeManager {
     line: number,
     character: number,
   ): Promise<LspRuntimeFileResult<Location | LocationLink[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -351,9 +468,21 @@ export class LspRuntimeManager {
     line: number,
     character: number,
     direction: "incoming" | "outgoing",
-  ): Promise<LspRuntimeFileResult<CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
-    const items = await target.client.prepareCallHierarchy(target.uri, line, character);
+  ): Promise<
+    LspRuntimeFileResult<
+      CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null
+    >
+  > {
+    const target = await this.prepareFilePositionTarget(
+      filePath,
+      line,
+      character,
+    );
+    const items = await target.client.prepareCallHierarchy(
+      target.uri,
+      line,
+      character,
+    );
     if (!items || items.length === 0) {
       return {
         serverId: target.client.serverId,
@@ -363,9 +492,10 @@ export class LspRuntimeManager {
         result: null,
       };
     }
-    const result = direction === "incoming"
-      ? await target.client.callHierarchyIncomingCalls(items[0])
-      : await target.client.callHierarchyOutgoingCalls(items[0]);
+    const result =
+      direction === "incoming"
+        ? await target.client.callHierarchyIncomingCalls(items[0])
+        : await target.client.callHierarchyOutgoingCalls(items[0]);
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -403,7 +533,12 @@ export class LspRuntimeManager {
   activeClients(): Array<{ id: string; serverId: string; rootDir: string }> {
     const active: Array<{ id: string; serverId: string; rootDir: string }> = [];
     for (const client of this.clients.values()) {
-      if (!client.isExited) active.push({ id: client.id, serverId: client.serverId, rootDir: client.rootDir });
+      if (!client.isExited)
+        active.push({
+          id: client.id,
+          serverId: client.serverId,
+          rootDir: client.rootDir,
+        });
     }
     return active;
   }
@@ -411,12 +546,20 @@ export class LspRuntimeManager {
   private workspaceSymbolClients(): ClientTarget[] {
     const active: ClientTarget[] = [];
     for (const client of this.clients.values()) {
-      if (!client.isExited) active.push({ client, serverId: client.serverId, rootDir: client.rootDir, started: false });
+      if (!client.isExited)
+        active.push({
+          client,
+          serverId: client.serverId,
+          rootDir: client.rootDir,
+          started: false,
+        });
     }
     return active;
   }
 
-  private async prepareFileTarget(filePath: string): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  private async prepareFileTarget(
+    filePath: string,
+  ): Promise<SelectedServer & { client: LspClient; uri: string }> {
     const selected = await this.selectServerForFile(filePath);
     return this.attachClient(selected);
   }
@@ -431,14 +574,20 @@ export class LspRuntimeManager {
     return this.attachClient(selected);
   }
 
-  private async attachClient(selected: SelectedServer): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  private async attachClient(
+    selected: SelectedServer,
+  ): Promise<SelectedServer & { client: LspClient; uri: string }> {
     const target = await this.ensureClient({
       server: selected.server,
       rootDir: selected.rootDir,
       rootMarker: selected.rootMarker,
       allowPromptInstall: false,
     });
-    const uri = await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
+    const uri = await target.client.syncFile(
+      selected.filePath,
+      selected.filetype,
+      selected.text,
+    );
     return { ...selected, client: target.client, uri };
   }
 
@@ -446,15 +595,21 @@ export class LspRuntimeManager {
     const resolvedPath = this.resolvePath(filePath);
     const text = await readFile(resolvedPath, "utf8");
     const cached = this.filetypeCache.get(resolvedPath);
-    const filetype = cached ?? detectFiletype({ path: resolvedPath, content: text });
+    const filetype =
+      cached ?? detectFiletype({ path: resolvedPath, content: text });
     if (cached === undefined) {
       if (filetype) this.filetypeCache.set(resolvedPath, filetype);
     }
     if (!filetype) {
-      throw new LspRuntimeError(`No LSP filetype detected for ${resolvedPath}.`, "no-filetype");
+      throw new LspRuntimeError(
+        `No LSP filetype detected for ${resolvedPath}.`,
+        "no-filetype",
+      );
     }
 
-    const server = Object.values(this.config.catalog.servers).find((entry) => entry.filetypes.includes(filetype));
+    const server = Object.values(this.config.catalog.servers).find((entry) =>
+      entry.filetypes.includes(filetype),
+    );
     if (!server) {
       throw new LspRuntimeError(
         `No configured LSP server handles filetype ${filetype} for ${resolvedPath}.`,
@@ -463,7 +618,8 @@ export class LspRuntimeManager {
     }
 
     const root = await detectRoot(resolvedPath, server.rootMarkers);
-    const rootDir = root && this.isInsideAnyWorkspace(root.rootDir) ? root.rootDir : this.cwd;
+    const rootDir =
+      root && this.isInsideAnyWorkspace(root.rootDir) ? root.rootDir : this.cwd;
     return {
       server,
       rootDir,
@@ -494,7 +650,10 @@ export class LspRuntimeManager {
           : `${serverId} is already running for ${target.rootDir}.`,
       };
     } catch (error) {
-      if (error instanceof LspRuntimeError && (error.code === "not-installed" || error.code === "declined")) {
+      if (
+        error instanceof LspRuntimeError &&
+        (error.code === "not-installed" || error.code === "declined")
+      ) {
         return {
           serverId,
           rootDir,
@@ -502,13 +661,22 @@ export class LspRuntimeManager {
           message: error.message,
         };
       }
-      return { serverId, rootDir, status: "error", message: error instanceof Error ? error.message : String(error) };
+      return {
+        serverId,
+        rootDir,
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
   private getServer(serverId: string): ServerDefinition {
     const server = this.config.catalog.servers[serverId];
-    if (!server) throw new LspRuntimeError(`Unknown LSP server: ${serverId}.`, "no-server");
+    if (!server)
+      throw new LspRuntimeError(
+        `Unknown LSP server: ${serverId}.`,
+        "no-server",
+      );
     return server;
   }
 
@@ -558,7 +726,12 @@ export class LspRuntimeManager {
       });
       await client.start();
       this.clients.set(input.key, client);
-      return { client, serverId: input.server.id, rootDir: input.rootDir, started: true };
+      return {
+        client,
+        serverId: input.server.id,
+        rootDir: input.rootDir,
+        started: true,
+      };
     } catch (error) {
       await client?.shutdown().catch(() => false);
       throw new LspRuntimeError(
@@ -568,12 +741,19 @@ export class LspRuntimeManager {
     }
   }
 
-  private async ensureInstalled(serverId: string, options: ClientStartOptions): Promise<InstalledServerMetadata> {
+  private async ensureInstalled(
+    serverId: string,
+    options: ClientStartOptions,
+  ): Promise<InstalledServerMetadata> {
     const lockfile = await readLockfile(this.lockfileOptions);
     const existing = lockfile.servers[serverId];
     if (existing) return existing;
 
-    if (!options.allowPromptInstall && (!(options.allowAutoInstall ?? true) || this.config.installMode !== "auto")) {
+    if (
+      !options.allowPromptInstall &&
+      (!(options.allowAutoInstall ?? true) ||
+        this.config.installMode !== "auto")
+    ) {
       throw new LspRuntimeError(
         `${serverId} is not installed. Run /lsp install ${serverId} to install it explicitly.`,
         "not-installed",
@@ -582,16 +762,25 @@ export class LspRuntimeManager {
 
     const result = await this.installManager.ensureInstalled(serverId);
     if (result.status === "installed") return result.metadata;
-    throw new LspRuntimeError(result.message, result.status === "declined" ? "declined" : "not-installed");
+    throw new LspRuntimeError(
+      result.message,
+      result.status === "declined" ? "declined" : "not-installed",
+    );
   }
 
   private async installedServerIds(): Promise<string[]> {
     const lockfile = await readLockfile(this.lockfileOptions);
-    return Object.keys(lockfile.servers).filter((serverId) => this.config.catalog.servers[serverId] !== undefined);
+    return Object.keys(lockfile.servers).filter(
+      (serverId) => this.config.catalog.servers[serverId] !== undefined,
+    );
   }
 
-  private async shutdownClients(predicate: (client: LspClient) => boolean): Promise<ClientShutdownResult[]> {
-    const entries = [...this.clients.entries()].filter(([_key, client]) => predicate(client));
+  private async shutdownClients(
+    predicate: (client: LspClient) => boolean,
+  ): Promise<ClientShutdownResult[]> {
+    const entries = [...this.clients.entries()].filter(([_key, client]) =>
+      predicate(client),
+    );
     const stopped = await Promise.all(
       entries.map(async ([key, client]) => {
         const didStop = await client.shutdown();
@@ -603,7 +792,9 @@ export class LspRuntimeManager {
   }
 
   private resolvePath(filePath: string): string {
-    const resolvedPath = isAbsolute(filePath) ? resolve(filePath) : resolve(this.cwd, filePath);
+    const resolvedPath = isAbsolute(filePath)
+      ? resolve(filePath)
+      : resolve(this.cwd, filePath);
     if (!this.isInsideAnyWorkspace(resolvedPath)) {
       throw new LspRuntimeError(
         `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd}.`,
@@ -624,12 +815,24 @@ function clientKey(serverId: string, rootDir: string): string {
 
 function isPathInside(rootDir: string, targetPath: string): boolean {
   const relativePath = relative(resolve(rootDir), resolve(targetPath));
-  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !isAbsolute(relativePath))
+  );
 }
 
-function validatePosition(selected: SelectedServer, line: number, character: number): void {
+function validatePosition(
+  selected: SelectedServer,
+  line: number,
+  character: number,
+): void {
   const lines = splitLines(selected.text);
-  if (!Number.isInteger(line) || !Number.isInteger(character) || line < 0 || character < 0) {
+  if (
+    !Number.isInteger(line) ||
+    !Number.isInteger(character) ||
+    line < 0 ||
+    character < 0
+  ) {
     throw new LspRuntimeError(
       `Invalid LSP position for ${selected.filePath}. Use a valid 1-based line/column from the file and place the column on an identifier token.`,
       "invalid-position",
