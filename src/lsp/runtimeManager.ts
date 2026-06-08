@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { delay } from "../util/helpers.js";
 import type {
@@ -16,6 +16,7 @@ import type {
   WorkspaceEdit,
   WorkspaceSymbol,
 } from "vscode-languageserver-protocol";
+import { URI } from "vscode-uri";
 import { detectFiletype } from "../detect/filetypes.js";
 import { detectRoot } from "../detect/root.js";
 import type { LoadLspConfigResult } from "../config/loadConfig.js";
@@ -308,6 +309,167 @@ export class LspRuntimeManager {
     };
   }
 
+  /**
+   * Runs diagnostics AND queries code actions at a generic position.
+   * Returns both so the caller can annotate each diagnostic with fix availability.
+   */
+  async diagnosticsWithFixes(
+    filePath: string,
+  ): Promise<{
+    diagnostics: LspDiagnosticsResult;
+    codeActions: LspRuntimeFileResult<(CodeAction | Command)[] | null>;
+    diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }>;
+  }> {
+    const diagResult = await this.diagnostics(filePath);
+
+    // Sort diagnostics consistently so indices align with formatDiagnostics output
+    const allDiags = [...diagResult.diagnostics].sort(compareRawDiagnostics);
+
+    if (allDiags.length === 0) {
+      return {
+        diagnostics: diagResult,
+        codeActions: await this.codeAction(filePath, 1, 1),
+        diagnosticActions: [],
+      };
+    }
+
+    // Query code actions at each diagnostic position with that diagnostic as context.
+    // This lets LSP servers return per-diagnostic scoped actions when they support it.
+    // When they return file-wide actions (e.g. ruff-lsp's source.fixAll),
+    // the empty diagnostics field means they cover all diagnostics.
+    const uniqueActions = new Map<string, CodeAction>();
+    let primaryServerId = "";
+    let primaryUri = "";
+    const diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }> = [];
+
+    // Collect per-diagnostic actions by querying at each position
+    for (let i = 0; i < allDiags.length && i < 10; i++) {
+      const d = allDiags[i];
+      const line = d.range.start.line + 1;
+      const col = d.range.start.character + 1;
+
+      let caResult: LspRuntimeFileResult<(CodeAction | Command)[] | null>;
+      try {
+        caResult = await this.codeAction(filePath, line, col, [d]);
+      } catch {
+        continue;
+      }
+      const actions = caResult.result ?? [];
+
+      if (!primaryServerId) {
+        primaryServerId = caResult.serverId;
+        primaryUri = caResult.uri;
+      }
+
+      const titles: string[] = [];
+      for (const action of actions) {
+        if ("title" in action && !("command" in action)) {
+          const ca = action as CodeAction;
+          const actionDiags = ca.diagnostics ?? [];
+          const matches =
+            actionDiags.length === 0 ||
+            actionDiags.some(
+              (ad) =>
+                ad.message === d.message &&
+                ad.range.start.line === d.range.start.line &&
+                ad.range.start.character === d.range.start.character,
+            );
+          if (matches && !uniqueActions.has(ca.title)) {
+            uniqueActions.set(ca.title, ca);
+          }
+          if (matches) {
+            titles.push(ca.title);
+          }
+        }
+      }
+      diagnosticActions.push({ diagnosticIndex: i, actionTitles: titles });
+    }
+
+    // Always also try generic position to catch file-wide actions
+    // that may not appear at every diagnostic position.
+    let genericActions: (CodeAction | Command)[] = [];
+    try {
+      const genericResult = await this.codeAction(filePath, 1, 1);
+      genericActions = genericResult.result ?? [];
+      if (!primaryServerId) {
+        primaryServerId = genericResult.serverId;
+        primaryUri = genericResult.uri;
+      }
+    } catch {
+      // ignore
+    }
+    // Collect any file-wide actions (those with no per-diagnostic scope)
+    const fileWideTitles: string[] = [];
+    for (const action of genericActions) {
+      if ("title" in action && !("command" in action)) {
+        const ca = action as CodeAction;
+        if (!uniqueActions.has(ca.title)) {
+          uniqueActions.set(ca.title, ca);
+        }
+        // Actions with no diagnostics field are file-wide; they cover everything
+        if ((ca.diagnostics ?? []).length === 0) {
+          if (!fileWideTitles.includes(ca.title)) {
+            fileWideTitles.push(ca.title);
+          }
+        }
+      }
+    }
+
+    // Apply file-wide actions to any diagnostics that don't have specific actions yet
+    if (fileWideTitles.length > 0) {
+      for (let i = 0; i < allDiags.length; i++) {
+        const existing = diagnosticActions.find((da) => da.diagnosticIndex === i);
+        if (existing && existing.actionTitles.length === 0) {
+          existing.actionTitles.push(...fileWideTitles);
+        } else if (!existing) {
+          diagnosticActions.push({
+            diagnosticIndex: i,
+            actionTitles: [...fileWideTitles],
+          });
+        }
+      }
+      // Also ensure warnings without their own actions get covered
+      for (const action of genericActions) {
+        if ("title" in action && !("command" in action)) {
+          const ca = action as CodeAction;
+          if (ca.diagnostics && ca.diagnostics.length > 0) {
+            // Per-diagnostic scoped actions: match by position
+            for (let i = 0; i < allDiags.length; i++) {
+              const d = allDiags[i];
+              const matched = ca.diagnostics.some(
+                (ad) =>
+                  ad.message === d.message &&
+                  ad.range.start.line === d.range.start.line,
+              );
+              if (matched) {
+                const existing = diagnosticActions.find((da) => da.diagnosticIndex === i);
+                if (existing) {
+                  if (!existing.actionTitles.includes(ca.title)) {
+                    existing.actionTitles.push(ca.title);
+                  }
+                } else {
+                  diagnosticActions.push({ diagnosticIndex: i, actionTitles: [ca.title] });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return {
+      diagnostics: diagResult,
+      codeActions: {
+        serverId: primaryServerId,
+        rootDir: diagResult.rootDir,
+        filePath: diagResult.filePath,
+        uri: primaryUri,
+        result: Array.from(uniqueActions.values()),
+      },
+      diagnosticActions,
+    };
+  }
+
   async hover(
     filePath: string,
     line: number,
@@ -390,18 +552,155 @@ export class LspRuntimeManager {
     filePath: string,
     line: number,
     character: number,
+    diagnostics?: Diagnostic[],
   ): Promise<LspRuntimeFileResult<(CodeAction | Command)[] | null>> {
     const target = await this.prepareFilePositionTarget(
       filePath,
       line,
       character,
     );
+    const context = diagnostics ? { diagnostics } : undefined;
+    let result = await target.client.codeAction(target.uri, line, character, context);
+    let serverId = target.client.serverId;
+    let rootDir = target.client.rootDir;
+
+    // If the primary server returned no code actions, try a fallback server
+    // for the same filetype (e.g. ruff for lint auto-fixes when pyright
+    // returns empty).
+    if (!result || result.length === 0) {
+      const fallback = this.findFallbackCodeActionServer(
+        target.server,
+        target.filetype,
+      );
+      if (fallback) {
+        try {
+          const fbTarget = await this.attachClient({
+            server: fallback,
+            rootDir: target.rootDir,
+            rootMarker: undefined,
+            filetype: target.filetype,
+            filePath: target.filePath,
+            text: target.text,
+          });
+          const fbResult = await fbTarget.client.codeAction(
+            fbTarget.uri,
+            line,
+            character,
+            context,
+          );
+          if (fbResult && fbResult.length > 0) {
+            result = fbResult;
+            serverId = fbTarget.client.serverId;
+            rootDir = fbTarget.client.rootDir;
+          }
+        } catch {
+          // Fallback failed silently -- keep original empty result
+        }
+      }
+    }
+
     return {
-      serverId: target.client.serverId,
-      rootDir: target.client.rootDir,
+      serverId,
+      rootDir,
       filePath: target.filePath,
       uri: target.uri,
-      result: await target.client.codeAction(target.uri, line, character),
+      result,
+    };
+  }
+
+  /**
+   * Queries code actions at the given position, finds the action matching
+   * `actionTitle`, extracts its WorkspaceEdit, and applies the text edits
+   * to disk. Returns a summary of what was changed.
+   */
+  async applyCodeAction(
+    filePath: string,
+    line: number,
+    character: number,
+    actionTitle: string,
+  ): Promise<{
+    serverId: string;
+    rootDir: string;
+    filePath: string;
+    actionTitle: string;
+    actionKind?: string;
+    changes: number;
+    files: string[];
+    error?: string;
+  }> {
+    const result = await this.codeAction(filePath, line, character);
+    const actions = result.result ?? [];
+
+    // Find the action by title (case-insensitive)
+    const match = actions.find(
+      (a): a is CodeAction =>
+        "title" in a &&
+        a.title.trim().toLowerCase() === actionTitle.trim().toLowerCase(),
+    );
+    if (!match) {
+      const available = actions
+        .map((a) => ("title" in a ? `"${a.title}"` : "(command)"))
+        .join(", ");
+      return {
+        serverId: result.serverId,
+        rootDir: result.rootDir,
+        filePath: result.filePath,
+        actionTitle,
+        changes: 0,
+        files: [],
+        error: `No action matching "${actionTitle}". Available: ${available}`,
+      };
+    }
+
+    const edit = match.edit;
+    if (!edit) {
+      return {
+        serverId: result.serverId,
+        rootDir: result.rootDir,
+        filePath: result.filePath,
+        actionTitle,
+        actionKind: match.kind,
+        changes: 0,
+        files: [],
+        error: `Action "${actionTitle}" has no associated WorkspaceEdit.`,
+      };
+    }
+
+    const fileSet = new Set<string>();
+    let totalChanges = 0;
+
+    // Apply changes (simple format: TextEdit[] per URI)
+    if (edit.changes) {
+      for (const [uri, textEdits] of Object.entries(edit.changes)) {
+        const fsPath = uriToFsPath(uri);
+        fileSet.add(fsPath);
+        totalChanges += (textEdits as Array<unknown>).length;
+        await applyTextEdits(fsPath, textEdits);
+      }
+    }
+
+    // Apply documentChanges (extended format: TextDocumentEdit)
+    if (edit.documentChanges) {
+      for (const dc of edit.documentChanges) {
+        if ("edits" in dc) {
+          const tde = dc as { textDocument: { uri: string }; edits: Array<{ range: { start: { line: number; character: number }; end: { line: number; character: number } }; newText: string }> };
+          const fsPath = uriToFsPath(tde.textDocument.uri);
+          fileSet.add(fsPath);
+          totalChanges += tde.edits.length;
+          await applyTextEdits(fsPath, tde.edits);
+        }
+        // CreateFile, RenameFile, DeleteFile are skipped (rare for code actions)
+      }
+    }
+
+    return {
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+      actionTitle,
+      actionKind: match.kind,
+      changes: totalChanges,
+      files: [...fileSet],
     };
   }
 
@@ -680,6 +979,23 @@ export class LspRuntimeManager {
     return server;
   }
 
+  /**
+   * Find a fallback server for code actions when the primary server returns
+   * empty results. Uses the first configured server that handles the same
+   * filetype but is not the current server (e.g. ruff for Python lint fixes
+   * when pyright returns no code actions).
+   */
+  private findFallbackCodeActionServer(
+    currentServer: ServerDefinition,
+    filetype: string,
+  ): ServerDefinition | undefined {
+    return Object.values(this.config.catalog.servers).find(
+      (entry) =>
+        entry.id !== currentServer.id &&
+        entry.filetypes.includes(filetype),
+    );
+  }
+
   private async ensureClient(input: EnsureClientInput): Promise<ClientTarget> {
     const server = input.server;
     const rootDir = resolve(input.rootDir);
@@ -857,4 +1173,61 @@ function validatePosition(
 
 function splitLines(text: string): string[] {
   return text.split(/\r\n|\r|\n/u);
+}
+
+/** Sort Diagnostic[] by severity (error first) then position. */
+function compareRawDiagnostics(a: Diagnostic, b: Diagnostic): number {
+  const sevA = a.severity ?? 4;
+  const sevB = b.severity ?? 4;
+  if (sevA !== sevB) return sevA - sevB;
+  const lineDiff = a.range.start.line - b.range.start.line;
+  if (lineDiff !== 0) return lineDiff;
+  return a.range.start.character - b.range.start.character;
+}
+
+function uriToFsPath(uri: string): string {
+  return URI.parse(uri).fsPath;
+}
+
+interface TextEditLike {
+  range: { start: { line: number; character: number }; end: { line: number; character: number } };
+  newText: string;
+}
+
+/**
+ * Applies a list of TextEdits to a file on disk.
+ * Edits are sorted in reverse order (by line, then character descending)
+ * so that earlier positions are not shifted by later edits.
+ */
+async function applyTextEdits(fsPath: string, edits: TextEditLike[]): Promise<void> {
+  const text = await readFile(fsPath, "utf8");
+  const lines = text.split("\n");
+
+  // Sort edits in reverse order so they don't interfere
+  const sorted = [...edits].sort((a, b) => {
+    const lineDiff = b.range.start.line - a.range.start.line;
+    if (lineDiff !== 0) return lineDiff;
+    return b.range.start.character - a.range.start.character;
+  });
+
+  for (const edit of sorted) {
+    const startLine = edit.range.start.line;
+    const startCol = edit.range.start.character;
+    const endLine = edit.range.end.line;
+    const endCol = edit.range.end.character;
+
+    if (startLine === endLine) {
+      // Single-line edit
+      const line = lines[startLine];
+      lines[startLine] = line.slice(0, startCol) + edit.newText + line.slice(endCol);
+    } else {
+      // Multi-line edit: replace range with newText
+      const firstPart = lines[startLine].slice(0, startCol);
+      const lastPart = lines[endLine].slice(endCol);
+      const middle = edit.newText;
+      lines.splice(startLine, endLine - startLine + 1, firstPart + middle + lastPart);
+    }
+  }
+
+  await writeFile(fsPath, lines.join("\n"), "utf8");
 }

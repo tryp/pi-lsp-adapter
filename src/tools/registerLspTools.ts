@@ -7,10 +7,12 @@ import type { LspExtensionState } from "../state.js";
 import { setLspStatusLine } from "../statusLine.js";
 import {
   failure,
+  success,
   formatCallHierarchy,
   formatCodeActions,
   formatDefinition,
   formatDiagnostics,
+  formatDiagnosticsWithFixes,
   formatDocumentSymbols,
   formatHover,
   formatImplementations,
@@ -32,6 +34,11 @@ function registerToolPromptGuidelines(pi: ExtensionAPI): void {
 
 const FilePathParams = Type.Object({
   filePath: Type.String({ description: "Path to the source file to inspect." }),
+  checkFixes: Type.Optional(
+    Type.Boolean({
+      description: "When true, also queries lsp_code_action and annotates each diagnostic with fix availability.",
+    }),
+  ),
 });
 
 const FilePositionParams = Type.Object({
@@ -86,6 +93,12 @@ const CodeActionParams = Type.Object({
     description:
       "1-based column/character number. Place it on the identifier or error token.",
   }),
+  apply: Type.Optional(
+    Type.String({
+      description:
+        "Optional title of a code action to apply (e.g. 'Ruff: Fix All'). When provided, the action's WorkspaceEdit is executed and files are modified.",
+    }),
+  ),
 });
 
 const CallHierarchyParams = Type.Object({
@@ -146,6 +159,17 @@ export function registerLspTools(
       if (!state)
         return failure("lsp_diagnostics", "LSP extension is not initialized.");
       try {
+        if (params.checkFixes) {
+          const both = await state.runtimeManager.diagnosticsWithFixes(params.filePath);
+          const result = formatDiagnosticsWithFixes(
+            both.diagnostics,
+            both.codeActions,
+            both.diagnosticActions,
+            state.resultCache,
+          );
+          refreshStatus(ctx, state);
+          return result;
+        }
         const result = formatDiagnostics(
           await state.runtimeManager.diagnostics(params.filePath),
           state.resultCache,
@@ -370,15 +394,36 @@ export function registerLspTools(
       if (!state)
         return failure("lsp_code_action", "LSP extension is not initialized.");
       try {
-        const position = toLspPosition(params);
-        const result = formatCodeActions(
-          await state.runtimeManager.codeAction(
+        // If an action title was specified, apply it rather than listing
+        if (params.apply) {
+          const position = toLspPosition(params);
+          const result = await state.runtimeManager.applyCodeAction(
             params.filePath,
             position.line,
             position.character,
-          ),
-          state.resultCache,
+            params.apply,
+          );
+          refreshStatus(ctx, state);
+          if (result.error) {
+            return success(
+              `Applied code action "${params.apply}": ${result.error}`,
+              { ...result, ok: false },
+            );
+          }
+          const fileList = result.files.join(", ");
+          return success(
+            `Applied code action "${params.apply}" on ${result.filePath} (${result.serverId}):\n` +
+              `${result.changes} change(s) across ${result.files.length} file(s): ${fileList}`,
+            { ...result, ok: true },
+          );
+        }
+        const position = toLspPosition(params);
+        const caResult = await state.runtimeManager.codeAction(
+          params.filePath,
+          position.line,
+          position.character,
         );
+        const result = formatCodeActions(caResult, state.resultCache);
         refreshStatus(ctx, state);
         return result;
       } catch (error) {
