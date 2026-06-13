@@ -28,7 +28,15 @@ export type GetLspToolState = () => LspExtensionState | null;
 
 function registerToolPromptGuidelines(pi: ExtensionAPI): void {
   pi.registerToolPromptGuidelines("read", [
-    "For discovering file structure (functions, classes, variables, imports) use lsp_document_symbols first — it returns structure directly. Only read specific line ranges after you know what to look for.",
+    "To get file structure (functions, classes, variables, imports) use lsp_document_symbols first — returns a tree with line numbers, no file content transferred. Only read specific line ranges after you know what to look for.",
+    "To get type/signature/docs for a symbol use lsp_hover on the identifier instead of reading the surrounding code block.",
+    "To find where a symbol is defined use lsp_definition on the identifier instead of grep + read.",
+    "To check for lint/type errors use lsp_diagnostics first instead of reading the whole file searching for problems.",
+  ]);
+  pi.registerToolPromptGuidelines("grep", [
+    "To find all usages of a symbol across the workspace use lsp_references on the identifier — returns file:line:col directly, no grep needed.",
+    "To find where a symbol is defined use lsp_definition on the identifier — returns the exact file:line:col, more reliable than grep.",
+    "To search for symbols by name without knowing file paths use lsp_workspace_symbols.",
   ]);
 }
 
