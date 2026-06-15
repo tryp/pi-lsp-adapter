@@ -173,6 +173,8 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       {
         customType: "auto_diag",
         content: body,
+        display: false,  // invisible in UI; still written to session file
+                          // but skipped on session restore (see session-manager.ts)
       },
       { deliverAs: "steer" },
     );
