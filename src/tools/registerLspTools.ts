@@ -237,6 +237,15 @@ const ReferencesParams = Type.Object({
 
 const WorkspaceSymbolsParams = Type.Object({
   query: Type.String({ description: "Workspace symbol query string." }),
+  kind: Type.Optional(
+    Type.String({
+      description:
+        "Filter by symbol kind: comma-separated list, e.g. \"function,class,method\". " +
+        "Accepted: file, module, namespace, package, class, method, property, field, " +
+        "constructor, enum, interface, function, variable, constant, string, number, " +
+        "boolean, array, object, key, null, enumMember, struct, event, operator, typeParameter.",
+    }),
+  ),
   serverId: Type.Optional(
     Type.String({
       description: "Optional LSP server id to query, e.g. pyright or vtsls.",
@@ -494,12 +503,14 @@ export function registerLspTools(
     name: "lsp_workspace_symbols",
     label: "LSP Workspace Symbols",
     description:
-      "Search symbols across active LSP workspaces. Optionally provide a server id to start/query that server for the current cwd.",
+      "Search symbols across active LSP workspaces. Optionally filter by kind and/or provide a server id.",
     promptSnippet:
       "Search workspace symbols by name across active language-server sessions.",
     promptGuidelines: [
-      "Use lsp_workspace_symbols to locate definitions or related symbols by name when file paths are unknown. Omit serverId to query active servers only; provide a configured serverId, such as vtsls or pyright, when you want to start/query a specific server for the current cwd.",
-      "Returns matching symbols with file:line locations — no file content transferred. More efficient than grep for named symbols.",
+      "Use lsp_workspace_symbols to locate definitions or related symbols by partial name when file paths are unknown. More efficient than grep for named symbols.",
+      "Optionally set kind to filter results to specific symbol types, e.g. kind=\"function,class,method\" to see only function/class/method definitions.",
+      "Omit serverId to query active servers only; provide a configured serverId to start/query a specific server.",
+      "Returns matching symbols with file:line locations — no file content transferred.",
     ],
     parameters: WorkspaceSymbolsParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -510,13 +521,14 @@ export function registerLspTools(
           "LSP extension is not initialized.",
         );
       try {
+        const raw = await state.runtimeManager.workspaceSymbols(
+          params.query,
+          params.serverId,
+        );
         const result = formatWorkspaceSymbols(
-          await state.runtimeManager.workspaceSymbols(
-            params.query,
-            params.serverId,
-          ),
+          raw,
           state.resultCache,
-          { query: params.query },
+          { query: params.query, kind: params.kind },
         );
         refreshStatus(ctx, state);
         return result;
