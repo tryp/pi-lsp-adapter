@@ -193,7 +193,8 @@ function registerToolPromptGuidelines(pi: ExtensionAPI): void {
   pi.registerToolPromptGuidelines("grep", [
     "To find ALL usages of a symbol across the workspace use lsp_references — returns file:line:col directly, no grep needed.",
     "To find where a symbol is defined use lsp_definition on the identifier — exact file:line:col, more reliable than grep.",
-    "To search for symbols by name without knowing file paths use lsp_workspace_symbols.",
+    "To search for functions, classes, or other symbols by name without knowing file paths use lsp_workspace_symbols with kind=\"function,class,method\" etc.",
+    "To find symbols by partial name across all file types use lsp_workspace_symbols instead of grep — returns typed results with file:line locations.",
   ]);
   pi.registerToolPromptGuidelines("remind", [
     "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — the callback auto-cancels if the job completes before the timer fires.",
