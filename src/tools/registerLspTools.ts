@@ -173,6 +173,8 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       {
         customType: "auto_diag",
         content: body,
+        display: false,  // invisible in UI; still written to session file
+                          // but skipped on session restore (see session-manager.ts)
       },
       { deliverAs: "steer" },
     );
@@ -183,14 +185,14 @@ export type GetLspToolState = () => LspExtensionState | null;
 
 function registerToolPromptGuidelines(pi: ExtensionAPI): void {
   pi.registerToolPromptGuidelines("read", [
-    "To get file structure (functions, classes, variables, imports) use lsp_document_symbols first — returns a tree with line numbers, no file content transferred. Only read specific line ranges after you know what to look for.",
-    "To get type/signature/docs for a symbol use lsp_hover on the identifier instead of reading the surrounding code block.",
+    "To get file structure use lsp_document_symbols first — returns tree with line numbers, no file content. After calling it, do NOT read the same file for structure — the tree is complete.",
+    "To get type/signature/docs use lsp_hover on the identifier. Do NOT read the surrounding code block — hover returns full type info compactly.",
     "To find where a symbol is defined use lsp_definition on the identifier instead of grep + read.",
-    "To check for lint/type errors use lsp_diagnostics first instead of reading the whole file searching for problems.",
+    "To check for lint/type errors use lsp_diagnostics first instead of reading the whole file. Only read specific flagged lines.",
   ]);
   pi.registerToolPromptGuidelines("grep", [
-    "To find all usages of a symbol across the workspace use lsp_references on the identifier — returns file:line:col directly, no grep needed.",
-    "To find where a symbol is defined use lsp_definition on the identifier — returns the exact file:line:col, more reliable than grep.",
+    "To find ALL usages of a symbol across the workspace use lsp_references — returns file:line:col directly, no grep needed.",
+    "To find where a symbol is defined use lsp_definition on the identifier — exact file:line:col, more reliable than grep.",
     "To search for symbols by name without knowing file paths use lsp_workspace_symbols.",
   ]);
   pi.registerToolPromptGuidelines("remind", [
@@ -359,8 +361,8 @@ export function registerLspTools(
     promptSnippet:
       "Fetch hover/type information for a symbol at a 1-based line and column.",
     promptGuidelines: [
-      "Use lsp_hover when symbol type, signature, documentation, or inferred information would reduce guesswork. Put line/column on the identifier token itself, not whitespace or surrounding syntax.",
-      "Returns only the type signature and docs for the symbol at that position — compact and focused, unlike reading the surrounding code block for the same information.",
+      "Use lsp_hover when you need symbol type, signature, or docs. Put line/column on the identifier token, not whitespace or surrounding syntax.",
+      "Do NOT read the surrounding code block after hover — hover returns the full type info compactly.",
     ],
     parameters: FilePositionParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -393,8 +395,8 @@ export function registerLspTools(
     promptSnippet:
       "Jump to definitions for a symbol at a 1-based line and column.",
     promptGuidelines: [
-      "Use lsp_definition before changing unfamiliar call sites, types, or imported symbols. Put line/column on the identifier token itself, not an import path string or surrounding syntax.",
-      "Returns file:line:column targets only — does not transfer file content.",
+      "Use lsp_definition before changing unfamiliar call sites, types, or imported symbols. Put line/column on the identifier token, not import path strings.",
+      "Returns file:line:column targets only — no file content transferred.",
     ],
     parameters: FilePositionParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -463,8 +465,8 @@ export function registerLspTools(
     promptSnippet:
       "List functions, classes, variables, and other symbols in a source file.",
     promptGuidelines: [
-      "Use lsp_document_symbols INSTEAD OF reading L1-60 to understand a file's structure. Returns a tree of all functions, classes, and variables with line numbers — no file content transferred. Only needs filePath (no line/col required).",
-      "After lsp_document_symbols, follow up with lsp_hover on specific lines to inspect individual function signatures instead of re-reading the file.",
+      "Use lsp_document_symbols INSTEAD OF reading L1-60 for file structure. Returns tree of all functions/classes/variables with line numbers. After calling it, do NOT also read the file for structure — the tree is complete.",
+      "After lsp_document_symbols, use lsp_hover on specific lines for signature info instead of reading the code block.",
     ],
     parameters: FilePathParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
