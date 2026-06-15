@@ -36,8 +36,10 @@ interface MockExtensionApi {
   registerTool: (tool: CapturedTool) => void;
   registerToolPromptGuidelines: (toolName: string, g: string[]) => void;
   registerCommand: (...args: any[]) => void;
+  registerFlag: (name: string, opts: any) => void;
   on: (event: string, handler: any) => void;
   getFlag: (name: string) => any;
+  sendMessage: (msg: any, opts?: any) => void;
   events: { on: (e: string, h: any) => void; emit: (e: string, ...a: any[]) => void };
 }
 
@@ -51,8 +53,10 @@ function createMockPi(): { pi: MockExtensionApi; tools: CapturedTool[]; guidelin
     registerToolPromptGuidelines: (toolName: string, g: string[]) =>
       guidelines.push({ toolName, guidelines: g }),
     registerCommand: () => {},
+    registerFlag: () => {},
     on: (event: string, handler: any) => { eventHandlers[event] = handler; },
     getFlag: () => undefined,
+    sendMessage: () => {},
     events: {
       on: (e: string, h: any) => { eventHandlers[e] = h; },
       emit: () => {},
