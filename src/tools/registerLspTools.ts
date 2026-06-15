@@ -3,8 +3,10 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { Diagnostic } from "vscode-languageserver-types";
 import type { LspExtensionState } from "../state.js";
 import { setLspStatusLine } from "../statusLine.js";
+import type { LspDiagnosticsResult } from "../lsp/client.js";
 import {
   failure,
   success,
@@ -24,6 +26,159 @@ import {
 } from "./lspFormat.js";
 import { LSP_RESULT_ID_LENGTH, LSP_RESULT_ID_PATTERN } from "./resultCache.js";
 
+// ─── Auto-diagnostics on edit/write ────────────────────────────────────
+//
+// Caches pre-mutation diagnostics so we can report only *new* errors
+// introduced by an edit or write. Errors with LSP code-action fixes
+// are annotated so the agent can apply them with lsp_code_action(apply).
+//
+// Gated behind --auto-diag (boolean flag, default off).
+
+const pendingBeforeDiags = new Map<string, Diagnostic[]>();
+
+function sortDiags(a: Diagnostic, b: Diagnostic): number {
+  if (a.range.start.line !== b.range.start.line)
+    return a.range.start.line - b.range.start.line;
+  if (a.range.start.character !== b.range.start.character)
+    return a.range.start.character - b.range.start.character;
+  const msgCmp = a.message.localeCompare(b.message);
+  if (msgCmp !== 0) return msgCmp;
+  return String(a.code ?? "").localeCompare(String(b.code ?? ""));
+}
+
+function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
+  pi.registerFlag("auto-diag", {
+    description:
+      "After every edit/write, run diagnostics and steer the agent if new" +
+      " lint/type errors were introduced. On by default.",
+    type: "boolean",
+    default: true,
+  });
+
+  // Snapshot pre-mutation diagnostics so we can diff post-mutation.
+  pi.on("tool_call", (event) => {
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+    const filePath = event.input.path;
+    if (!filePath || typeof filePath !== "string") return;
+
+    const state = getState();
+    if (!state) return;
+
+    // Fire-and-forget — diagnostics reads cached LSP state, near-instant.
+    state.runtimeManager
+      .diagnostics(filePath)
+      .then((r: LspDiagnosticsResult) => {
+        pendingBeforeDiags.set(`${event.toolCallId}:${filePath}`, r.diagnostics);
+      })
+      .catch(() => {});
+  });
+
+  // Compare post-mutation diagnostics against cached pre-state; steer on new errors.
+  pi.on("tool_result", async (event, _ctx) => {
+    if (event.isError) return;
+    if (event.toolName !== "edit" && event.toolName !== "write") return;
+
+    const filePath = (event.input as { path?: string }).path;
+    if (!filePath) return;
+
+    const enabled = pi.getFlag("auto-diag");
+    if (!enabled) return;
+
+    const state = getState();
+    if (!state) return;
+
+    const cacheKey = `${event.toolCallId}:${filePath}`;
+    const before = pendingBeforeDiags.get(cacheKey);
+    pendingBeforeDiags.delete(cacheKey);
+
+    // Run diagnostics + query code actions on post-mutation state.
+    let afterResult: {
+      diagnostics: LspDiagnosticsResult;
+      diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }>;
+    };
+    try {
+      afterResult = await state.runtimeManager.diagnosticsWithFixes(filePath);
+    } catch {
+      return; // LSP doesn't cover this file type — nothing to report.
+    }
+
+    const rawAfter = afterResult.diagnostics.diagnostics;
+
+    // Sort both arrays identically so diagnosticActions indices align.
+    const sortedBefore = (before ?? []).sort(sortDiags);
+    const sortedAfter = [...rawAfter].sort(sortDiags);
+
+    // Build a Set-key for each before-diagnostic for O(n) lookup.
+    const beforeKeys = new Set(
+      sortedBefore.map(
+        (d) => `${d.range.start.line}:${d.range.start.character}:${d.message}:${d.code ?? ""}`,
+      ),
+    );
+
+    // Collect new Error-severity diagnostics (DiagnosticSeverity.Error === 1).
+    type DaEntry = { diagnosticIndex: number; actionTitles: string[] };
+    const diagActionMap = new Map<number, string[]>(
+      afterResult.diagnosticActions.map((da: DaEntry) => [da.diagnosticIndex, da.actionTitles]),
+    );
+
+    interface NewDiag {
+      d: Diagnostic;
+      sortedIndex: number;
+    }
+    const newErrors: NewDiag[] = [];
+    for (let i = 0; i < sortedAfter.length; i++) {
+      const d = sortedAfter[i];
+      if (d.severity !== 1) continue;
+      const key = `${d.range.start.line}:${d.range.start.character}:${d.message}:${d.code ?? ""}`;
+      if (beforeKeys.has(key)) continue;
+      newErrors.push({ d, sortedIndex: i });
+    }
+
+    if (newErrors.length === 0) return;
+
+    // Build steer message.
+    const lines: string[] = [];
+    let fixableCount = 0;
+
+    for (let i = 0; i < newErrors.length && i < 5; i++) {
+      const { d, sortedIndex } = newErrors[i];
+      const fixTitles = diagActionMap.get(sortedIndex);
+      const hasFix = fixTitles && fixTitles.length > 0;
+      if (hasFix) fixableCount++;
+      const fixSuffix = hasFix
+        ? ` [Fix: "${fixTitles![0]}"]`
+        : "";
+      const codeStr = d.code ? ` (${d.code})` : "";
+      lines.push(`  L${d.range.start.line + 1}${codeStr} ${d.message}${fixSuffix}`);
+    }
+
+    const overflow =
+      newErrors.length > 5
+        ? `\n  ... and ${newErrors.length - 5} more`
+        : "";
+
+    const fixHint =
+      fixableCount > 0
+        ? ` (${fixableCount} fixable)`
+        : "";
+
+    const body =
+      `[auto-diag] ${filePath}: ${newErrors.length} new error(s)${fixHint}\n` +
+      lines.join("\n") +
+      overflow +
+      "\n" +
+      `Use \`lsp_code_action\` with \`apply\` to apply an available fix.`;
+
+    pi.sendMessage(
+      {
+        customType: "auto_diag",
+        content: body,
+      },
+      { deliverAs: "steer" },
+    );
+  });
+}
+
 export type GetLspToolState = () => LspExtensionState | null;
 
 function registerToolPromptGuidelines(pi: ExtensionAPI): void {
@@ -37,6 +192,10 @@ function registerToolPromptGuidelines(pi: ExtensionAPI): void {
     "To find all usages of a symbol across the workspace use lsp_references on the identifier — returns file:line:col directly, no grep needed.",
     "To find where a symbol is defined use lsp_definition on the identifier — returns the exact file:line:col, more reliable than grep.",
     "To search for symbols by name without knowing file paths use lsp_workspace_symbols.",
+  ]);
+  pi.registerToolPromptGuidelines("remind", [
+    "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — the callback auto-cancels if the job completes before the timer fires.",
+    "Use manual remind() only for standalone reminders that aren't linked to a job.",
   ]);
 }
 
@@ -150,11 +309,12 @@ export function registerLspTools(
   getState: GetLspToolState,
 ): void {
   registerToolPromptGuidelines(pi);
+  registerAutoDiag(pi, getState);
   pi.registerTool<typeof FilePathParams, unknown>({
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
     description:
-      "Read diagnostics for a file using its configured language server. Returns only severity/source/code/line:col per issue, no file content transferred.",
+      "Read diagnostics for a file using its configured language server. Returns only severity/source/code/line:col per issue, no file content transferred. Supported file types depend on which LSP servers are configured — use lsp_list_workspace_roots to see what's available.",
     promptSnippet:
       "Inspect compiler/type/lint diagnostics from configured language servers for a file.",
     promptGuidelines: [
@@ -195,7 +355,7 @@ export function registerLspTools(
     name: "lsp_hover",
     label: "LSP Hover",
     description:
-      "Get hover/type information for a symbol at a 1-based line and column.",
+      "Get hover/type information for a symbol at a 1-based line and column. Works on any file type with a configured LSP server (including .md via marksman) — use lsp_list_workspace_roots to see which servers are active.",
     promptSnippet:
       "Fetch hover/type information for a symbol at a 1-based line and column.",
     promptGuidelines: [
@@ -229,7 +389,7 @@ export function registerLspTools(
     name: "lsp_definition",
     label: "LSP Definition",
     description:
-      "Find definition locations for the symbol at a source position. line and column are 1-based.",
+      "Find definition locations for the symbol at a source position. line and column are 1-based. On .md files this navigates to heading, anchor, and wiki-link targets. Use lsp_list_workspace_roots to see configured servers.",
     promptSnippet:
       "Jump to definitions for a symbol at a 1-based line and column.",
     promptGuidelines: [
@@ -264,7 +424,7 @@ export function registerLspTools(
     name: "lsp_references",
     label: "LSP References",
     description:
-      "Find references for the symbol at a source position. line and column are 1-based.",
+      "Find references for the symbol at a source position. line and column are 1-based. On .md files this finds backlinks to headings, tags, and wiki-link targets. Use lsp_list_workspace_roots to see configured servers.",
     promptSnippet: "Find references for a symbol at a 1-based line and column.",
     promptGuidelines: [
       "Use lsp_references to assess impact before renames, API changes, or behavior changes. Put line/column on the identifier token itself; set includeDeclaration when you need the declaration included in the results.",
@@ -299,7 +459,7 @@ export function registerLspTools(
     name: "lsp_document_symbols",
     label: "LSP Document Symbols",
     description:
-      "List symbols in a source file using its configured language server. Only needs filePath — no line/col required.",
+      "List symbols in a source file using its configured language server. Only needs filePath — no line/col required. Works on .md files (headings, sections) and all other file types with configured LSP servers — use lsp_list_workspace_roots to see what's available.",
     promptSnippet:
       "List functions, classes, variables, and other symbols in a source file.",
     promptGuidelines: [
@@ -638,11 +798,14 @@ export function registerLspTools(
     name: "lsp_list_workspace_roots",
     label: "LSP List Workspace Roots",
     description:
-      "List all directories currently in LSP workspace scope. " +
+      "List all directories currently in LSP workspace scope, along with " +
+      "configured LSP servers and their supported file types. " +
       "Includes the project root and any extra workspace roots configured or " +
       "added dynamically via lsp_add_workspace_root.",
-    promptSnippet: "List all directories currently in LSP workspace scope.",
+    promptSnippet:
+      "List LSP workspace roots and configured servers with their file types.",
     promptGuidelines: [
+      "Use lsp_list_workspace_roots to discover what LSP servers are configured and which file types each supports. This is the primary tool for assessing your LSP capabilities at runtime.",
       "Use lsp_list_workspace_roots to verify that a directory was added successfully.",
     ],
     parameters: ListWorkspaceRootsParams,
@@ -654,8 +817,25 @@ export function registerLspTools(
           "LSP extension is not initialized.",
         );
       const roots = state.runtimeManager.listWorkspaceRoots();
-      if (roots.length === 0) return "No LSP workspace roots configured.";
-      return `LSP workspace roots (${roots.length}):\n${roots.map((r) => `  - ${r}`).join("\n")}`;
+
+      // Build server details from catalog
+      const servers = state.config.catalog.servers;
+      const serverIds = Object.keys(servers);
+      const activeClients = state.runtimeManager.activeClients();
+      const activeIds = new Set(activeClients.map((c) => c.serverId));
+
+      const serverLines = serverIds.map((id) => {
+        const s = servers[id];
+        const status = activeIds.has(id) ? "active" : "inactive";
+        const fts = s.filetypes.join(", ");
+        return `  - ${id}: ${s.displayName} (${fts}) [${status}]`;
+      });
+
+      let result = `LSP workspace roots (${roots.length}):\n`;
+      result += roots.map((r) => `  - ${r}`).join("\n");
+      result += `\n\nConfigured LSP servers (${serverIds.length}):\n`;
+      result += serverLines.join("\n");
+      return result;
     },
   });
 }

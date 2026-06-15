@@ -9,10 +9,12 @@ interface StatusLineContext {
 }
 
 export function formatLspStatusLine(state: LspExtensionState): string {
-  const active = new Set(state.runtimeManager.activeClients().map((client) => client.serverId)).size;
+  const activeClients = state.runtimeManager.activeClients();
+  const activeIds = [...new Set(activeClients.map((client) => client.serverId))].sort();
   const total = Object.keys(state.config.catalog.servers).length;
   const warnings = state.config.warnings.length;
-  return `LSP: ${active}/${total} servers${warnings > 0 ? `, ${warnings} warning(s)` : ""}`;
+  const activePart = activeIds.length > 0 ? activeIds.join(", ") : "(none active)";
+  return `LSP: ${activeIds.length}/${total} servers: ${activePart}${warnings > 0 ? `, ${warnings} warning(s)` : ""}`;
 }
 
 export function setLspStatusLine(ctx: StatusLineContext, state: LspExtensionState): void {
