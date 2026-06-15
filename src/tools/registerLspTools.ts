@@ -154,7 +154,7 @@ export function registerLspTools(
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
     description:
-      "Read diagnostics for a file using its configured language server. Returns only severity/source/code/line:col per issue, no file content transferred.",
+      "Read diagnostics for a file using its configured language server. Returns only severity/source/code/line:col per issue, no file content transferred. Supported file types depend on which LSP servers are configured — use lsp_list_workspace_roots to see what's available.",
     promptSnippet:
       "Inspect compiler/type/lint diagnostics from configured language servers for a file.",
     promptGuidelines: [
@@ -195,7 +195,7 @@ export function registerLspTools(
     name: "lsp_hover",
     label: "LSP Hover",
     description:
-      "Get hover/type information for a symbol at a 1-based line and column.",
+      "Get hover/type information for a symbol at a 1-based line and column. Works on any file type with a configured LSP server (including .md via marksman) — use lsp_list_workspace_roots to see which servers are active.",
     promptSnippet:
       "Fetch hover/type information for a symbol at a 1-based line and column.",
     promptGuidelines: [
@@ -229,7 +229,7 @@ export function registerLspTools(
     name: "lsp_definition",
     label: "LSP Definition",
     description:
-      "Find definition locations for the symbol at a source position. line and column are 1-based.",
+      "Find definition locations for the symbol at a source position. line and column are 1-based. On .md files this navigates to heading, anchor, and wiki-link targets. Use lsp_list_workspace_roots to see configured servers.",
     promptSnippet:
       "Jump to definitions for a symbol at a 1-based line and column.",
     promptGuidelines: [
@@ -264,7 +264,7 @@ export function registerLspTools(
     name: "lsp_references",
     label: "LSP References",
     description:
-      "Find references for the symbol at a source position. line and column are 1-based.",
+      "Find references for the symbol at a source position. line and column are 1-based. On .md files this finds backlinks to headings, tags, and wiki-link targets. Use lsp_list_workspace_roots to see configured servers.",
     promptSnippet: "Find references for a symbol at a 1-based line and column.",
     promptGuidelines: [
       "Use lsp_references to assess impact before renames, API changes, or behavior changes. Put line/column on the identifier token itself; set includeDeclaration when you need the declaration included in the results.",
@@ -299,7 +299,7 @@ export function registerLspTools(
     name: "lsp_document_symbols",
     label: "LSP Document Symbols",
     description:
-      "List symbols in a source file using its configured language server. Only needs filePath — no line/col required.",
+      "List symbols in a source file using its configured language server. Only needs filePath — no line/col required. Works on .md files (headings, sections) and all other file types with configured LSP servers — use lsp_list_workspace_roots to see what's available.",
     promptSnippet:
       "List functions, classes, variables, and other symbols in a source file.",
     promptGuidelines: [
@@ -638,11 +638,14 @@ export function registerLspTools(
     name: "lsp_list_workspace_roots",
     label: "LSP List Workspace Roots",
     description:
-      "List all directories currently in LSP workspace scope. " +
+      "List all directories currently in LSP workspace scope, along with " +
+      "configured LSP servers and their supported file types. " +
       "Includes the project root and any extra workspace roots configured or " +
       "added dynamically via lsp_add_workspace_root.",
-    promptSnippet: "List all directories currently in LSP workspace scope.",
+    promptSnippet:
+      "List LSP workspace roots and configured servers with their file types.",
     promptGuidelines: [
+      "Use lsp_list_workspace_roots to discover what LSP servers are configured and which file types each supports. This is the primary tool for assessing your LSP capabilities at runtime.",
       "Use lsp_list_workspace_roots to verify that a directory was added successfully.",
     ],
     parameters: ListWorkspaceRootsParams,
@@ -654,8 +657,25 @@ export function registerLspTools(
           "LSP extension is not initialized.",
         );
       const roots = state.runtimeManager.listWorkspaceRoots();
-      if (roots.length === 0) return "No LSP workspace roots configured.";
-      return `LSP workspace roots (${roots.length}):\n${roots.map((r) => `  - ${r}`).join("\n")}`;
+
+      // Build server details from catalog
+      const servers = state.config.catalog.servers;
+      const serverIds = Object.keys(servers);
+      const activeClients = state.runtimeManager.activeClients();
+      const activeIds = new Set(activeClients.map((c) => c.serverId));
+
+      const serverLines = serverIds.map((id) => {
+        const s = servers[id];
+        const status = activeIds.has(id) ? "active" : "inactive";
+        const fts = s.filetypes.join(", ");
+        return `  - ${id}: ${s.displayName} (${fts}) [${status}]`;
+      });
+
+      let result = `LSP workspace roots (${roots.length}):\n`;
+      result += roots.map((r) => `  - ${r}`).join("\n");
+      result += `\n\nConfigured LSP servers (${serverIds.length}):\n`;
+      result += serverLines.join("\n");
+      return result;
     },
   });
 }
