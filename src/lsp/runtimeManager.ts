@@ -328,7 +328,7 @@ export class LspRuntimeManager {
     if (allDiags.length === 0) {
       return {
         diagnostics: diagResult,
-        codeActions: await this.codeAction(filePath, 1, 1),
+        codeActions: await this.codeAction(filePath, 1, 1, undefined, true),
         diagnosticActions: [],
       };
     }
@@ -350,7 +350,7 @@ export class LspRuntimeManager {
 
       let caResult: LspRuntimeFileResult<(CodeAction | Command)[] | null>;
       try {
-        caResult = await this.codeAction(filePath, line, col, [d]);
+        caResult = await this.codeAction(filePath, line, col, [d], true);
       } catch {
         continue;
       }
@@ -389,7 +389,7 @@ export class LspRuntimeManager {
     // that may not appear at every diagnostic position.
     let genericActions: (CodeAction | Command)[] = [];
     try {
-      const genericResult = await this.codeAction(filePath, 1, 1);
+      const genericResult = await this.codeAction(filePath, 1, 1, undefined, true);
       genericActions = genericResult.result ?? [];
       if (!primaryServerId) {
         primaryServerId = genericResult.serverId;
@@ -553,6 +553,7 @@ export class LspRuntimeManager {
     line: number,
     character: number,
     diagnostics?: Diagnostic[],
+    skipFallback?: boolean,
   ): Promise<LspRuntimeFileResult<(CodeAction | Command)[] | null>> {
     const target = await this.prepareFilePositionTarget(
       filePath,
@@ -567,7 +568,10 @@ export class LspRuntimeManager {
     // If the primary server returned no code actions, try a fallback server
     // for the same filetype (e.g. ruff for lint auto-fixes when pyright
     // returns empty).
-    if (!result || result.length === 0) {
+    // Skip fallback in auto-diag path (diagnosticsWithFixes) because secondary
+    // servers like ruff-lsp only offer file-wide lint actions (Organize Imports)
+    // that don't actually fix the specific diagnostic — they just create noise.
+    if (!skipFallback && (!result || result.length === 0)) {
       const fallback = this.findFallbackCodeActionServer(
         target.server,
         target.filetype,
@@ -820,11 +824,23 @@ export class LspRuntimeManager {
       : this.workspaceSymbolClients();
     const results: LspWorkspaceSymbolsResult[] = [];
     for (const target of clients) {
-      results.push({
-        serverId: target.client.serverId,
-        rootDir: target.client.rootDir,
-        result: await target.client.workspaceSymbols(query),
-      });
+      try {
+        const result = await target.client.workspaceSymbols(query);
+        if (result) {
+          results.push({
+            serverId: target.client.serverId,
+            rootDir: target.client.rootDir,
+            result,
+          });
+        }
+      } catch (e) {
+        // When no specific serverId was requested, skip clients that
+        // don't support workspace symbols (e.g., ruff-lsp, ruff —
+        // linter-only servers). When a specific server is requested,
+        // surface the error so the user knows the server can't
+        // fulfill the request.
+        if (serverId) throw e;
+      }
     }
     return results;
   }
