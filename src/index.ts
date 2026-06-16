@@ -59,7 +59,6 @@ export default function piAgentLspExtension(pi: ExtensionAPI): void {
 - Use lsp_list_workspace_roots to see all directories in scope.${serverBlock}\n`,
     };
   });
-  });
 
   pi.on("session_start", async (_event, ctx) => {
     const currentGeneration = ++generation;
