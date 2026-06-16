@@ -820,11 +820,23 @@ export class LspRuntimeManager {
       : this.workspaceSymbolClients();
     const results: LspWorkspaceSymbolsResult[] = [];
     for (const target of clients) {
-      results.push({
-        serverId: target.client.serverId,
-        rootDir: target.client.rootDir,
-        result: await target.client.workspaceSymbols(query),
-      });
+      try {
+        const result = await target.client.workspaceSymbols(query);
+        if (result) {
+          results.push({
+            serverId: target.client.serverId,
+            rootDir: target.client.rootDir,
+            result,
+          });
+        }
+      } catch (e) {
+        // When no specific serverId was requested, skip clients that
+        // don't support workspace symbols (e.g., ruff-lsp, ruff —
+        // linter-only servers). When a specific server is requested,
+        // surface the error so the user knows the server can't
+        // fulfill the request.
+        if (serverId) throw e;
+      }
     }
     return results;
   }
