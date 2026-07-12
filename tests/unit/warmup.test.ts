@@ -35,7 +35,7 @@ describe("registerLspWarmup", () => {
     handler(readEvent("src/index.ts"), ctx);
     await flushPromises();
 
-    expect(ctx.ui.statuses.lsp).toBe("LSP: 1/1 servers");
+    expect(ctx.ui.statuses.lsp).toBe("LSP: 1/1 servers: vtsls");
   });
 
   it("does not warm files when warmup is disabled", () => {

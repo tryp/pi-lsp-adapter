@@ -64,7 +64,7 @@ describe("extension entrypoint", () => {
 
     expect(ctx.ui.statuses.lsp).toMatch(/LSP: 0\/\d+ servers/u);
     expect(ctx.ui.notifications.at(-1)?.message).toContain("LSP status");
-    expect(beforeAgent).toMatchObject({ systemPrompt: expect.stringContaining("LSP integration") });
+    expect(beforeAgent).toMatchObject({ systemPrompt: expect.stringContaining("EFFICIENCY RULES") });
 
     await pi.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
     expect(ctx.ui.statuses.lsp).toBeUndefined();
@@ -88,6 +88,8 @@ function fakePi(): {
       on: (event: string, handler: Handler) => handlers.set(event, handler),
       registerCommand: (name: string, command: CommandHandler) => commands.set(name, command),
       registerTool: (tool: ToolHandler) => tools.set(tool.name, tool),
+      registerToolPromptGuidelines: () => {},
+      registerFlag: () => {},
     } as never,
   };
 }
