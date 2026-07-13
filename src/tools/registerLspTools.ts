@@ -2,6 +2,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import * as path from "node:path";
 import { Type } from "typebox";
 import type { Diagnostic } from "vscode-languageserver-types";
 import type { LspExtensionState } from "../state.js";
@@ -17,6 +18,7 @@ import {
   formatDiagnosticsWithFixes,
   formatDocumentSymbols,
   formatHover,
+  formatImpact,
   formatImplementations,
   formatReferences,
   formatRenameEdit,
@@ -25,6 +27,7 @@ import {
   toLspPosition,
 } from "./lspFormat.js";
 import { LSP_RESULT_ID_LENGTH, LSP_RESULT_ID_PATTERN } from "./resultCache.js";
+import { ImpactParams, resolveSymbols, analyzeImpact, formatAmbiguity } from "./lspImpact.js";
 
 // ─── Auto-diagnostics on edit/write ────────────────────────────────────
 //
@@ -805,6 +808,88 @@ export function registerLspTools(
         return `${result.resolved} is already in LSP workspace scope.`;
       } catch (error) {
         return failure("lsp_add_workspace_root", error);
+      }
+    },
+  });
+
+  pi.registerTool<typeof ImpactParams, unknown>({
+    name: "lsp_impact",
+    label: "LSP Impact Analysis",
+    description:
+      "Multi-symbol blast radius analysis. Given a list of changed symbol names or exact " +
+      "positions, finds every reference, caller, and test file affected across the workspace. " +
+      "Orchestrates lsp_references, lsp_call_hierarchy, and lsp_workspace_symbols across all " +
+      "touched symbols and aggregates the results by file.",
+    promptSnippet:
+      "Analyze the impact of changes to multiple symbols — finds all affected files, " +
+      "callers, references, and test files.",
+    promptGuidelines: [
+      "Use lsp_impact before editing shared or exported modules to understand blast radius.",
+      "Pass exact positions ({filePath, line, column}) for the symbols you're changing, " +
+        "or pass a bare name string to resolve via workspace symbols first.",
+      "For a single symbol, use lsp_references + lsp_call_hierarchy instead — lsp_impact " +
+        "is optimized for multi-symbol scenarios.",
+      "Call hierarchy is only queried for top-level function/method/constructor symbols. " +
+        "Transitive depth follows references, not callers.",
+    ],
+    parameters: ImpactParams,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const state = getState();
+      if (!state)
+        return failure("lsp_impact", "LSP extension is not initialized.");
+      try {
+        const cwd = process.cwd();
+        const depth = params.depth ?? 1;
+
+        // Resolve symbols (names -> positions via workspace symbols)
+        const { resolved, ambiguous } = await resolveSymbols(
+          params.symbols,
+          state.runtimeManager,
+        );
+
+        // Ambiguous names: return candidates for the agent to disambiguate
+        if (ambiguous.length > 0) {
+          return success(formatAmbiguity(ambiguous), {
+            ok: true,
+            kind: "impact_ambiguous",
+            candidates: ambiguous,
+          });
+        }
+
+        if (resolved.length === 0) {
+          return failure(
+            "lsp_impact",
+            "None of the specified symbols could be resolved. " +
+            "Provide a bare name string, {name} with optional filePath/kind, " +
+            "or an exact {filePath, line, column}. " +
+            "Bare name resolution depends on the LSP server being indexed. " +
+            "If you know the file, use {name, filePath} for faster matching.",
+          );
+        }
+
+        // Normalize paths to absolute for consistent dedup with LSP URIs
+        for (const s of resolved) {
+          s.filePath = path.resolve(cwd, s.filePath);
+        }
+
+        // Run the impact analysis
+        const report = await analyzeImpact(resolved, { depth }, state.runtimeManager);
+
+        // Format and return
+        const formatted = formatImpact(report);
+        refreshStatus(ctx, state);
+        return success(formatted, {
+          ok: true,
+          kind: "impact_report",
+          stats: {
+            changed: report.changed.length,
+            files: report.affectedFiles.length,
+            locations: report.totalLocations,
+          },
+        });
+      } catch (error) {
+        refreshStatus(ctx, state);
+        return failure("lsp_impact", error);
       }
     },
   });
