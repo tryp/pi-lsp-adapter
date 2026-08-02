@@ -51,14 +51,14 @@ export default function piAgentLspExtension(pi: ExtensionAPI): void {
       : "";
 
     return {
-      systemPrompt: `${event.systemPrompt}\n\n**EFFICIENCY RULES (follow strictly):**\n- To discover functions/classes/variables in a file -> lsp_document_symbols (NOT read)\n- To get a symbol's type/signature/docs -> lsp_hover on the identifier (NOT read)\n- To find where something is defined -> lsp_definition (NOT grep/read)\n- To assess rename impact -> lsp_references (NOT grep)\n- To get code actions after diagnostics -> lsp_code_action (NOT manual edit)\n- To see actual code body -> read with specific line range (only after lsp_document_symbols)\n\nWhen an LSP result says "More available" and includes a resultId, use lsp_more only if you need the next sequential page; re-run the original LSP query if the resultId is missing or expired. For hover, definition, and references, place the column on the identifier token itself. LSP tools use 1-based line/column inputs and do not mutate files. LSP tool output is compact (file:line:col + symbol metadata) and does not transfer full file content — LSP calls survive compaction better than large file read outputs.
+      systemPrompt: `${event.systemPrompt}\n\n**EFFICIENCY RULES (follow strictly):**\n- To discover functions/classes/variables -> lsp_document_symbols (NOT read). After it, do NOT read for structure — the symbol tree is complete.\n- To check lint/type errors after editing -> lsp_diagnostics FIRST. Only read specific flagged lines.\n- To get type/signature/docs -> lsp_hover. Do NOT read surrounding block — hover returns the full type info.\n- To find definitions -> lsp_definition (NOT grep/read).\n- To assess rename impact -> lsp_references (NOT grep).\n- When lsp_diagnostics shows fixable errors -> lsp_code_action with apply=True to auto-fix.\n- For actual code body -> read specific line range (after lsp_document_symbols).\n\nWhen LSP result says "More available" with resultId, use lsp_more for next page. For hover/definition/references, put column on identifier. LSP uses 1-based line/col. Output is compact (file:line:col) — LSP calls survive compaction better than file reads.
 
 **Cross-project analysis:**
-- LSP tools are limited to project directory scopes and any extra workspace roots configured in lsp.json).
-- To analyze code outside the current project, use lsp_add_workspace_root first to add the target directory into scope.
-- Use lsp_list_workspace_roots to see all directories currently in LSP scope.
-- lsp_add_workspace_root accepts absolute or relative paths; the directory must exist on disk.${serverBlock}\n`,
+- LSP tools are limited to project directory scopes.
+- Use lsp_add_workspace_root to add external directories into scope.
+- Use lsp_list_workspace_roots to see all directories in scope.${serverBlock}\n`,
     };
+  });
   });
 
   pi.on("session_start", async (_event, ctx) => {

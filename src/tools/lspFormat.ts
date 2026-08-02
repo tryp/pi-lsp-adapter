@@ -301,7 +301,7 @@ export function formatDocumentSymbols(
 export function formatWorkspaceSymbols(
   results: LspWorkspaceSymbolsResult[],
   cache?: LspResultCache,
-  options: FormatOptions & { query?: string } = {},
+  options: FormatOptions & { query?: string; kind?: string } = {},
 ): LspToolResult<PageMetadata<NormalizedSymbol & { serverId: string; rootDir: string }>> {
   const symbols = results.flatMap((entry) =>
     normalizeWorkspaceSymbols(entry.result ?? []).map((symbol) => ({
@@ -310,11 +310,19 @@ export function formatWorkspaceSymbols(
       rootDir: entry.rootDir,
     })),
   );
-  const ranked = symbols.sort(compareWorkspaceSymbols(options.query ?? ""));
+
+  const filtered = options.kind
+    ? symbols.filter((s) => {
+        const kinds = options.kind!.toLowerCase().split(/,\s*/);
+        return kinds.includes(s.kind.toLowerCase());
+      })
+    : symbols;
+
+  const ranked = filtered.sort(compareWorkspaceSymbols(options.query ?? ""));
 
   return paginateItems({
     kind: "workspace_symbols",
-    title: `LSP workspace symbols (${ranked.length}):`,
+    title: `LSP workspace symbols${options.kind ? ` (kind=${options.kind})` : ""} (${ranked.length}):`,
     emptyText: "No LSP workspace symbols found.",
     items: ranked,
     pageSize: options.pageSize ?? 50,

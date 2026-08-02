@@ -173,6 +173,8 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       {
         customType: "auto_diag",
         content: body,
+        display: false,  // invisible in UI; still written to session file
+                          // but skipped on session restore (see session-manager.ts)
       },
       { deliverAs: "steer" },
     );
@@ -183,15 +185,16 @@ export type GetLspToolState = () => LspExtensionState | null;
 
 function registerToolPromptGuidelines(pi: ExtensionAPI): void {
   pi.registerToolPromptGuidelines("read", [
-    "To get file structure (functions, classes, variables, imports) use lsp_document_symbols first — returns a tree with line numbers, no file content transferred. Only read specific line ranges after you know what to look for.",
-    "To get type/signature/docs for a symbol use lsp_hover on the identifier instead of reading the surrounding code block.",
+    "To get file structure use lsp_document_symbols first — returns tree with line numbers, no file content. After calling it, do NOT read the same file for structure — the tree is complete.",
+    "To get type/signature/docs use lsp_hover on the identifier. Do NOT read the surrounding code block — hover returns full type info compactly.",
     "To find where a symbol is defined use lsp_definition on the identifier instead of grep + read.",
-    "To check for lint/type errors use lsp_diagnostics first instead of reading the whole file searching for problems.",
+    "To check for lint/type errors use lsp_diagnostics first instead of reading the whole file. Only read specific flagged lines.",
   ]);
   pi.registerToolPromptGuidelines("grep", [
-    "To find all usages of a symbol across the workspace use lsp_references on the identifier — returns file:line:col directly, no grep needed.",
-    "To find where a symbol is defined use lsp_definition on the identifier — returns the exact file:line:col, more reliable than grep.",
-    "To search for symbols by name without knowing file paths use lsp_workspace_symbols.",
+    "To find ALL usages of a symbol across the workspace use lsp_references — returns file:line:col directly, no grep needed.",
+    "To find where a symbol is defined use lsp_definition on the identifier — exact file:line:col, more reliable than grep.",
+    "To search for functions, classes, or other symbols by name without knowing file paths use lsp_workspace_symbols with kind=\"function,class,method\" etc.",
+    "To find symbols by partial name across all file types use lsp_workspace_symbols instead of grep — returns typed results with file:line locations.",
   ]);
   pi.registerToolPromptGuidelines("remind", [
     "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — the callback auto-cancels if the job completes before the timer fires.",
@@ -235,6 +238,15 @@ const ReferencesParams = Type.Object({
 
 const WorkspaceSymbolsParams = Type.Object({
   query: Type.String({ description: "Workspace symbol query string." }),
+  kind: Type.Optional(
+    Type.String({
+      description:
+        "Filter by symbol kind: comma-separated list, e.g. \"function,class,method\". " +
+        "Accepted: file, module, namespace, package, class, method, property, field, " +
+        "constructor, enum, interface, function, variable, constant, string, number, " +
+        "boolean, array, object, key, null, enumMember, struct, event, operator, typeParameter.",
+    }),
+  ),
   serverId: Type.Optional(
     Type.String({
       description: "Optional LSP server id to query, e.g. pyright or vtsls.",
@@ -359,8 +371,8 @@ export function registerLspTools(
     promptSnippet:
       "Fetch hover/type information for a symbol at a 1-based line and column.",
     promptGuidelines: [
-      "Use lsp_hover when symbol type, signature, documentation, or inferred information would reduce guesswork. Put line/column on the identifier token itself, not whitespace or surrounding syntax.",
-      "Returns only the type signature and docs for the symbol at that position — compact and focused, unlike reading the surrounding code block for the same information.",
+      "Use lsp_hover when you need symbol type, signature, or docs. Put line/column on the identifier token, not whitespace or surrounding syntax.",
+      "Do NOT read the surrounding code block after hover — hover returns the full type info compactly.",
     ],
     parameters: FilePositionParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -393,8 +405,8 @@ export function registerLspTools(
     promptSnippet:
       "Jump to definitions for a symbol at a 1-based line and column.",
     promptGuidelines: [
-      "Use lsp_definition before changing unfamiliar call sites, types, or imported symbols. Put line/column on the identifier token itself, not an import path string or surrounding syntax.",
-      "Returns file:line:column targets only — does not transfer file content.",
+      "Use lsp_definition before changing unfamiliar call sites, types, or imported symbols. Put line/column on the identifier token, not import path strings.",
+      "Returns file:line:column targets only — no file content transferred.",
     ],
     parameters: FilePositionParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -463,8 +475,8 @@ export function registerLspTools(
     promptSnippet:
       "List functions, classes, variables, and other symbols in a source file.",
     promptGuidelines: [
-      "Use lsp_document_symbols INSTEAD OF reading L1-60 to understand a file's structure. Returns a tree of all functions, classes, and variables with line numbers — no file content transferred. Only needs filePath (no line/col required).",
-      "After lsp_document_symbols, follow up with lsp_hover on specific lines to inspect individual function signatures instead of re-reading the file.",
+      "Use lsp_document_symbols INSTEAD OF reading L1-60 for file structure. Returns tree of all functions/classes/variables with line numbers. After calling it, do NOT also read the file for structure — the tree is complete.",
+      "After lsp_document_symbols, use lsp_hover on specific lines for signature info instead of reading the code block.",
     ],
     parameters: FilePathParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -492,12 +504,14 @@ export function registerLspTools(
     name: "lsp_workspace_symbols",
     label: "LSP Workspace Symbols",
     description:
-      "Search symbols across active LSP workspaces. Optionally provide a server id to start/query that server for the current cwd.",
+      "Search symbols across active LSP workspaces. Optionally filter by kind and/or provide a server id.",
     promptSnippet:
       "Search workspace symbols by name across active language-server sessions.",
     promptGuidelines: [
-      "Use lsp_workspace_symbols to locate definitions or related symbols by name when file paths are unknown. Omit serverId to query active servers only; provide a configured serverId, such as vtsls or pyright, when you want to start/query a specific server for the current cwd.",
-      "Returns matching symbols with file:line locations — no file content transferred. More efficient than grep for named symbols.",
+      "Use lsp_workspace_symbols to locate definitions or related symbols by partial name when file paths are unknown. More efficient than grep for named symbols.",
+      "Optionally set kind to filter results to specific symbol types, e.g. kind=\"function,class,method\" to see only function/class/method definitions.",
+      "Omit serverId to query active servers only; provide a configured serverId to start/query a specific server.",
+      "Returns matching symbols with file:line locations — no file content transferred.",
     ],
     parameters: WorkspaceSymbolsParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -508,13 +522,14 @@ export function registerLspTools(
           "LSP extension is not initialized.",
         );
       try {
+        const raw = await state.runtimeManager.workspaceSymbols(
+          params.query,
+          params.serverId,
+        );
         const result = formatWorkspaceSymbols(
-          await state.runtimeManager.workspaceSymbols(
-            params.query,
-            params.serverId,
-          ),
+          raw,
           state.resultCache,
-          { query: params.query },
+          { query: params.query, kind: params.kind },
         );
         refreshStatus(ctx, state);
         return result;

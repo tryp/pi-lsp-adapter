@@ -13,16 +13,37 @@
 RUNTIME = $(HOME)/.pi/agent/npm/node_modules/pi-lsp-adapter
 SOURCE = $(HOME)/src/pi-lsp-adapter
 
-.PHONY: deploy verify link-packages test test-all smoke-test
+.PHONY: deploy verify link-packages link-pi-deps test test-all smoke-test
 
 link-packages:
 	@mkdir -p node_modules
 	@ln -sfn /home/dev/.pi/agent/npm/node_modules/typebox node_modules/typebox 2>/dev/null; echo "  [link] typebox"
+	@for pkg in vscode-uri vscode-jsonrpc vscode-languageserver-protocol vscode-languageserver-types; do \
+	  ln -sfn /home/dev/.pi/agent/npm/node_modules/$$pkg node_modules/$$pkg 2>/dev/null; \
+	  echo "  [link] $$pkg"; \
+	done
+
+link-pi-deps:  ## Ensure pi-lsp-adapter's npm deps are resolvable from pi's extension loader
+	@echo "Linking pi-lsp-adapter dependencies into pi-core's node_modules..."
+	@PI_NM=/home/dev/.pi/local/pi-coding-agent/node_modules; \
+	for pkg in vscode-uri vscode-jsonrpc vscode-languageserver-protocol vscode-languageserver-types; do \
+	  src=/home/dev/.pi/agent/npm/node_modules/$$pkg; \
+	  dst=$$PI_NM/$$pkg; \
+	  if [ ! -e "$$dst" ]; then \
+	    ln -sfn "$$src" "$$dst" && echo "  [link] $$pkg -> $$src"; \
+	  else \
+	    echo "  [skip] $$pkg already exists"; \
+	  fi; \
+	done
+	@echo "Verifying resolution..."
+	@for pkg in vscode-uri vscode-jsonrpc/node.js vscode-languageserver-protocol vscode-languageserver-types; do \
+	  node -e "try { require.resolve('$$pkg', { paths: ['/home/dev/.pi/local/pi-coding-agent/dist/core/extensions'] }); console.log('  OK: ' + '$$pkg'); } catch(e) { console.log('  FAIL: ' + '$$pkg: ' + e.message); }" 2>&1; \
+	done
 
 TSX = /home/dev/src/pi-mono/node_modules/.bin/tsx
 
-test: link-packages  ## Run interface tests
-	$(TSX) --test tests/interface.test.ts
+test: link-packages link-pi-deps  ## Run all tests
+	$(TSX) --test tests/*.test.ts
 
 test-all: test smoke-test  ## Run all tests
 
