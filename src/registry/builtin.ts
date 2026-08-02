@@ -1,7 +1,9 @@
 import type { BuiltinCatalog, FiletypeRules } from "./schema.js";
 
 export const BUILTIN_FILETYPE_RULES: Required<FiletypeRules> = {
-  exactFilenames: {},
+  exactFilenames: {
+    "CMakeLists.txt": "cmake",
+  },
   extensions: {
     ".js": "javascript",
     ".jsx": "javascriptreact",
@@ -15,6 +17,15 @@ export const BUILTIN_FILETYPE_RULES: Required<FiletypeRules> = {
     ".json": "json",
     ".jsonc": "jsonc",
     ".java": "java",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".cc": "cpp",
+    ".h": "c",
+    ".hpp": "cpp",
+    ".hxx": "cpp",
+    ".cmake": "cmake",
+    ".toml": "toml",
     ".md": "markdown",
     ".mdx": "markdown",
   },

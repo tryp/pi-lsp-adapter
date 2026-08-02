@@ -111,4 +111,34 @@ describe("detectFiletype", () => {
       }),
     ).toBe("typescript");
   });
+
+  it.each([
+    ["main.c", "c"],
+    ["main.cpp", "cpp"],
+    ["main.cxx", "cpp"],
+    ["main.cc", "cpp"],
+    ["main.h", "c"],
+    ["main.hpp", "cpp"],
+    ["main.hxx", "cpp"],
+    ["build.cmake", "cmake"],
+    ["Cargo.toml", "toml"],
+  ])("maps %s to %s", (path, expected) => {
+    expect(detectFiletype({ path })).toBe(expected);
+  });
+
+  it("detects .toml as toml even when content starts like JSON", () => {
+    expect(detectFiletype({ path: "pyproject.toml", content: "[project]\nname = \"x\"\n" })).toBe("toml");
+  });
+
+  it("detects .cmake as cmake even when content looks like JSON", () => {
+    expect(detectFiletype({ path: "cmake-build.cmake", content: 'if(FOO)\n  set(X "1")\nendif()\n' })).toBe("cmake");
+  });
+
+  it("detects CMakeLists.txt by exact filename before content fallback", () => {
+    expect(detectFiletype({ path: "CMakeLists.txt", content: "add_library(foo foo.c)\n" })).toBe("cmake");
+  });
+
+  it("detects CMakeLists.txt case-insensitively", () => {
+    expect(detectFiletype({ path: "cmakelists.txt" })).toBe("cmake");
+  });
 });

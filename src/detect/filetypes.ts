@@ -1,6 +1,18 @@
 import { BUILTIN_FILETYPE_RULES } from "../registry/builtin.js";
 import type { FiletypeRules } from "../registry/schema.js";
 
+// Hardcoded extension overrides for filetypes not yet in the builtin rules.
+// These are checked before content-based fallback to prevent TOML/CMake files
+// from being falsely detected as JSON (content starting with "[" or "{").
+const EXTENSION_OVERRIDES: Record<string, string> = {
+  ".toml": "toml",
+  ".cmake": "cmake",
+};
+
+const EXACT_FILENAME_OVERRIDES: Record<string, string> = {
+  "cmakelists.txt": "cmake",
+};
+
 export interface FiletypeOverrides extends FiletypeRules {
   filenames?: Record<string, string>;
 }
@@ -17,6 +29,8 @@ export function detectFiletype(input: DetectFiletypeInput): string | undefined {
 
   return (
     detectFromOverrides(input.overrides, basenameKey, extension) ??
+    lookupCaseInsensitive(EXTENSION_OVERRIDES, extension) ??
+    lookupCaseInsensitive(EXACT_FILENAME_OVERRIDES, basenameKey) ??
     lookupCaseInsensitive(BUILTIN_FILETYPE_RULES.exactFilenames, basenameKey) ??
     lookupCaseInsensitive(BUILTIN_FILETYPE_RULES.extensions, extension) ??
     detectFromContent(input.content)

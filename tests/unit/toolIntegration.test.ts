@@ -283,4 +283,69 @@ describe("LSP tool integration", () => {
 
     expect(result?.content[0]?.text).toContain("LSP extension is not initialized");
   });
+
+  it("lsp_add_workspace_root returns a content-bearing result", async () => {
+    const pi = fakePi();
+    const state = fakeState({
+      addWorkspaceRoot: async () => ({ added: true, resolved: join(tempHome, "ext") }),
+    });
+    registerLspTools(pi.api, () => state);
+
+    const result = await pi.tools.get("lsp_add_workspace_root")?.execute("tool-1", {
+      directory: join(tempHome, "ext"),
+    } as never);
+
+    expect(Array.isArray(result?.content)).toBe(true);
+    expect(result?.content[0]?.text).toContain("Added");
+    expect(result?.content[0]?.text).toContain("LSP workspace scope");
+  });
+
+  it("lsp_add_workspace_root returns an already-in-scope result", async () => {
+    const pi = fakePi();
+    const state = fakeState({
+      addWorkspaceRoot: async () => ({ added: false, resolved: join(tempHome, "ext") }),
+    });
+    registerLspTools(pi.api, () => state);
+
+    const result = await pi.tools.get("lsp_add_workspace_root")?.execute("tool-1", {
+      directory: join(tempHome, "ext"),
+    } as never);
+
+    expect(Array.isArray(result?.content)).toBe(true);
+    expect(result?.content[0]?.text).toContain("already in LSP workspace scope");
+  });
+
+  it("lsp_add_workspace_root returns failure when not initialized", async () => {
+    const pi = fakePi();
+    registerLspTools(pi.api, () => null);
+
+    const result = await pi.tools.get("lsp_add_workspace_root")?.execute("tool-1", {
+      directory: join(tempHome, "ext"),
+    } as never);
+
+    expect(result?.content[0]?.text).toContain("LSP extension is not initialized");
+  });
+
+  it("lsp_list_workspace_roots returns a content-bearing result", async () => {
+    const pi = fakePi();
+    const state = fakeState({
+      listWorkspaceRoots: () => [tempHome],
+      activeClients: () => [],
+    });
+    registerLspTools(pi.api, () => state);
+
+    const result = await pi.tools.get("lsp_list_workspace_roots")?.execute("tool-1", {} as never);
+
+    expect(Array.isArray(result?.content)).toBe(true);
+    expect(result?.content[0]?.text).toContain("LSP workspace roots");
+  });
+
+  it("lsp_list_workspace_roots returns failure when not initialized", async () => {
+    const pi = fakePi();
+    registerLspTools(pi.api, () => null);
+
+    const result = await pi.tools.get("lsp_list_workspace_roots")?.execute("tool-1", {} as never);
+
+    expect(result?.content[0]?.text).toContain("LSP extension is not initialized");
+  });
 });

@@ -803,9 +803,15 @@ export function registerLspTools(
           params.directory,
         );
         if (result.added) {
-          return `Added ${result.resolved} to LSP workspace scope.`;
+          return success(`Added ${result.resolved} to LSP workspace scope.`, {
+            added: true,
+            resolved: result.resolved,
+          });
         }
-        return `${result.resolved} is already in LSP workspace scope.`;
+        return success(`${result.resolved} is already in LSP workspace scope.`, {
+          added: false,
+          resolved: result.resolved,
+        });
       } catch (error) {
         return failure("lsp_add_workspace_root", error);
       }
@@ -931,11 +937,11 @@ export function registerLspTools(
         return `  - ${id}: ${s.displayName} (${fts}) [${status}]`;
       });
 
-      let result = `LSP workspace roots (${roots.length}):\n`;
-      result += roots.map((r) => `  - ${r}`).join("\n");
-      result += `\n\nConfigured LSP servers (${serverIds.length}):\n`;
-      result += serverLines.join("\n");
-      return result;
+      let text = `LSP workspace roots (${roots.length}):\n`;
+      text += roots.map((r) => `  - ${r}`).join("\n");
+      text += `\n\nConfigured LSP servers (${serverIds.length}):\n`;
+      text += serverLines.join("\n");
+      return success(text, { roots, servers: serverLines });
     },
   });
 }
