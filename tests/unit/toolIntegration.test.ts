@@ -38,6 +38,9 @@ function fakePi(): { api: never; tools: Map<string, Tool> } {
     tools,
     api: {
       registerTool: (tool: Tool) => tools.set(tool.name, tool),
+      registerToolPromptGuidelines: () => {},
+      registerFlag: () => {}, registerCommands: () => {},
+      on: () => {},
     } as never,
   };
 }

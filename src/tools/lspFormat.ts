@@ -20,6 +20,7 @@ import { URI } from "vscode-uri";
 import { messageFromError as baseMessageFromError } from "../util/helpers.js";
 import type { LspDiagnosticsResult } from "../lsp/client.js";
 import type { LspRuntimeFileResult, LspWorkspaceSymbolsResult } from "../lsp/runtimeManager.js";
+import type { ImpactReport } from "./lspImpact.js";
 import type { LspResultCache } from "./resultCache.js";
 
 export interface LspToolResult<TDetails> {
@@ -898,6 +899,144 @@ function conciseExpectedError(message: string): string {
   }
 
   return firstLine;
+}
+
+// ─── Impact analysis formatting ─────────────────────────────────────────
+
+/**
+ * Format an ImpactReport into a structured text report.
+ */
+export function formatImpact(report: ImpactReport): string {
+  const { changed, refs, callers, affectedFiles, testFiles, totalLocations, fileCounts } = report;
+
+  let output = `## Impact Analysis\n\n`;
+  output += `  Changed symbols: ${changed.length} in ${new Set(changed.map((s) => s.filePath)).size} files\n`;
+  output += `  Total affected files: ${affectedFiles.length}`;
+  if (testFiles.length > 0) {
+    output += ` (${testFiles.length} test files)`;
+  }
+  output += `\n`;
+  output += `  Total affected locations: ${totalLocations}\n`;
+  output += `\n`;
+
+  // ── Changed symbols ──
+  output += `### Changed Symbols\n\n`;
+  for (const sym of changed) {
+    const skey = `${sym.filePath}:${sym.line}:${sym.column}`;
+    const symRefs = refs.get(skey) ?? [];
+    const symCallers = callers.get(skey) ?? [];
+
+    output += `  ${sym.filePath}:${sym.line}:${sym.column}  \`${sym.name}\` (${sym.kind})`;
+    if (sym.containerName) output += ` [${sym.containerName}]`;
+    output += `\n`;
+    output += `    References: ${symRefs.length} across ${new Set(symRefs.map((r) => r.filePath)).size} files\n`;
+    if (symCallers.length > 0) {
+      output += `    Callers: ${symCallers.length}`;
+      // Show top caller files
+      const callerFiles = [...new Set(symCallers.map((r) => r.filePath))].slice(0, 5);
+      output += ` (${callerFiles.join(", ")}`;
+      if (callerFiles.length < new Set(symCallers.map((r) => r.filePath)).size) output += ", ...";
+      output += `)\n`;
+    }
+    output += `    ${horizontalRule()}\n`;
+
+    // Show affected sub-list
+    const allLocs = [...symRefs, ...symCallers];
+    const byFile = groupByFile(allLocs);
+    for (const [file, locs] of byFile) {
+      const isTest = isTestFilePath(file);
+      const tag = isTest ? " [TEST]" : "";
+      output += `      ${file}${tag} — ${locs.length} ${locs.length === 1 ? "ref" : "refs"}\n`;
+    }
+    output += `\n`;
+  }
+
+  // ── Test file summary ──
+  if (testFiles.length > 0) {
+    output += `### Test File Summary\n\n`;
+    for (const tf of testFiles) {
+      const tfRefs = [...refs.values(), ...callers.values()]
+        .flat()
+        .filter((r) => r.filePath === tf);
+      output += `  ${tf} — ${tfRefs.length} ${tfRefs.length === 1 ? "ref" : "refs"}`;
+      // Show which changed symbols they reference
+      const refNames = [...refs.entries()]
+        .filter(([, locs]) => locs.some((r) => r.filePath === tf))
+        .map(([key]) => {
+          const c = changed.find((s) => symbolKey(s) === key);
+          return c ? c.name : "<transitive>";
+        });
+      if (refNames.length > 0) {
+        output += ` to ${refNames.join(", ")}`;
+      }
+      output += `\n`;
+    }
+    output += `\n`;
+  }
+
+  // ── Files by impact level ──
+  output += `### Files by Impact Level\n\n`;
+  const high: string[] = [];
+  const moderate: string[] = [];
+  const low: string[] = [];
+
+  for (const [file, counts] of fileCounts) {
+    const total = counts.changed + counts.refs;
+    const entry = `  ${file} — ${total} ${total === 1 ? "ref" : "refs"}` +
+      (counts.changed > 0 ? ` (${counts.changed} changed)` : "") +
+      (counts.isTest ? " [TEST]" : "");
+    if (total >= 5) high.push(entry);
+    else if (total >= 2) moderate.push(entry);
+    else low.push(entry);
+  }
+
+  if (high.length > 0) {
+    output += `  HIGH (5+ refs):\n${high.join("\n")}\n\n`;
+  }
+  if (moderate.length > 0) {
+    output += `  MODERATE (2-4 refs):\n${moderate.join("\n")}\n\n`;
+  }
+  if (low.length > 0) {
+    output += `  LOW (1 ref):\n${low.join("\n")}\n\n`;
+  }
+
+  return output;
+}
+
+function horizontalRule(): string {
+  return "─".repeat(55);
+}
+
+function groupByFile(refs: Array<{ filePath: string; line: number; column: number }>): Map<string, typeof refs> {
+  const map = new Map<string, typeof refs>();
+  for (const r of refs) {
+    const existing = map.get(r.filePath);
+    if (existing) existing.push(r);
+    else map.set(r.filePath, [r]);
+  }
+  return map;
+}
+
+function isTestFilePath(filePath: string): boolean {
+  const lower = filePath.toLowerCase();
+  return (
+    lower.includes("test_") ||
+    lower.includes("_test") ||
+    lower.includes(".spec.") ||
+    lower.includes("__tests__") ||
+    lower.includes("/tests/") ||
+    lower.endsWith("_test.py") ||
+    lower.endsWith("_test.go") ||
+    lower.endsWith(".test.ts") ||
+    lower.endsWith(".test.tsx") ||
+    lower.endsWith(".test.js") ||
+    lower.endsWith(".spec.ts") ||
+    lower.endsWith(".spec.js")
+  );
+}
+
+function symbolKey(s: { filePath: string; line: number; column: number }): string {
+  return `${s.filePath}:${s.line}:${s.column}`;
 }
 
 function firstMeaningfulLine(message: string): string {
