@@ -1,4 +1,9 @@
 import type {
+  CallHierarchyIncomingCall,
+  CallHierarchyItem,
+  CallHierarchyOutgoingCall,
+  CodeAction,
+  Command,
   Definition,
   Diagnostic,
   DocumentSymbol,
@@ -8,6 +13,7 @@ import type {
   MarkupContent,
   Range,
   SymbolInformation,
+  WorkspaceEdit,
   WorkspaceSymbol,
 } from "vscode-languageserver-protocol";
 import { URI } from "vscode-uri";
@@ -122,6 +128,109 @@ export function formatDiagnostics(
   });
 }
 
+/**
+ * Like formatDiagnostics, but also accepts code action results and annotates
+ * each diagnostic line with fix availability info.
+ */
+export function formatDiagnosticsWithFixes(
+  diagResult: LspDiagnosticsResult,
+  codeActions: LspRuntimeFileResult<(CodeAction | Command)[] | null>,
+  diagnosticActions?: Array<{ diagnosticIndex: number; actionTitles: string[] }>,
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<NormalizedDiagnostic & { fixHint?: string }>> {
+  const base = formatDiagnostics(diagResult, cache, options);
+  if (!base.details.ok || base.details.total === 0) return base;
+
+  const filePath = diagResult.filePath;
+
+  // Sort diagnostics consistently with formatDiagnostics so indices align
+  const sortedDiagnostics = [...diagResult.diagnostics].sort(compareRawDiagnostics);
+
+  // Build a lookup from sorted diagnostic index to action titles
+  const actionMap = new Map<number, string[]>();
+  if (diagnosticActions && diagnosticActions.length > 0) {
+    for (const da of diagnosticActions) {
+      actionMap.set(da.diagnosticIndex, da.actionTitles);
+    }
+  } else {
+    // Fallback: use heuristics based on code action kinds
+    const actions = codeActions.result ?? [];
+    const hasOrganizeImports = actions.some(
+      (a) => "kind" in a && a.kind === "source.organizeImports",
+    );
+    const hasFixAll = actions.some(
+      (a) => "kind" in a && a.kind === "source.fixAll",
+    );
+    if (hasOrganizeImports || hasFixAll) {
+      for (let i = 0; i < sortedDiagnostics.length; i++) {
+        const titles: string[] = [];
+        if (hasOrganizeImports) titles.push("Ruff: Organize Imports");
+        if (hasFixAll) titles.push("Ruff: Fix All");
+        actionMap.set(i, titles);
+      }
+    }
+  }
+
+  // Annotate each diagnostic with actionable instructions
+  const items = base.details.items.map((d, idx) => {
+    const titles = actionMap.get(idx) ?? [];
+
+    let hint: string | undefined;
+    if (titles.length > 0) {
+      // Use the first available action for the instruction
+      const actionTitle = titles[0];
+      const diag = sortedDiagnostics[idx];
+      if (diag) {
+        const line = diag.range.start.line + 1;
+        const col = diag.range.start.character + 1;
+        hint =
+          `To auto-fix: call \`lsp_code_action(filePath="${filePath}", line=${line}, col=${col}, apply="${actionTitle}")\``;
+      }
+    } else {
+      const code = typeof d.code === "string" ? d.code : "";
+      const isUnusedVar = code === "reportUnusedVariable";
+      if (isUnusedVar) {
+        hint =
+          "No auto-fix via LSP; try `ruff check --fix --unsafe-fixes " +
+          filePath +
+          "` via bash";
+      }
+    }
+    return { ...d, fixHint: hint };
+  });
+
+  // Rebuild the text output with annotations
+  const lines = base.content[0].text.split("\n");
+  const resultLines: string[] = [];
+  for (const line of lines) {
+    resultLines.push(line);
+    const match = line.match(/^- (\w+) (\d+):(\d+)/);
+    if (match) {
+      const sev = match[1];
+      const ln = parseInt(match[2], 10);
+      const col = parseInt(match[3], 10);
+      const annotated = items.find(
+        (item) =>
+          item.severity === sev &&
+          item.range.start.line === ln &&
+          item.range.start.column === col,
+      );
+      if (annotated?.fixHint) {
+        resultLines.push(`    \u2192 ${annotated.fixHint}`);
+      }
+    }
+  }
+
+  return {
+    content: [{ type: "text", text: resultLines.join("\n") }],
+    details: {
+      ...base.details,
+      items,
+    },
+  };
+}
+
 export function formatHover(result: LspRuntimeFileResult<Hover | null>): LspToolResult<{
   ok: true;
   serverId: string;
@@ -216,6 +325,164 @@ export function formatWorkspaceSymbols(
       const path = symbol.location?.filePath ?? symbol.location?.uri;
       return `- ${symbol.name} (${symbol.kind}) ${symbol.serverId}${path ? ` ${path}` : ""}${where}`;
     },
+  });
+}
+
+export interface NormalizedCallHierarchyItem {
+  name: string;
+  kind: string;
+  detail?: string;
+  filePath?: string;
+  range?: DisplayRange;
+  depth?: number;
+}
+
+export interface NormalizedCodeAction {
+  title: string;
+  kind?: string;
+  diagnostics?: string[];
+  isPreferred?: boolean;
+  edit?: { changes: number; files: string[] };
+}
+
+export function formatCodeActions(
+  result: LspRuntimeFileResult<(CodeAction | Command)[] | null>,
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<NormalizedCodeAction>> {
+  const actions = normalizeCodeActions(result.result ?? []);
+  return paginateItems({
+    kind: "code_actions",
+    title: `LSP code actions for ${result.filePath} (${result.serverId}):`,
+    emptyText: `No LSP code actions for ${result.filePath}.`,
+    items: actions,
+    pageSize: options.pageSize ?? 50,
+    cache,
+    baseDetails: {
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+    },
+    formatItem: (action) => {
+      const parts: string[] = [];
+      if (action.isPreferred) parts.push("*");
+      parts.push(action.title);
+      if (action.kind) parts.push(`[${action.kind}]`);
+      if (action.edit) parts.push(`(edits ${action.edit.changes} location(s) across ${action.edit.files.length} file(s))`);
+      if (action.diagnostics && action.diagnostics.length > 0) {
+        for (const d of action.diagnostics) parts.push(`\n    diagnostic: ${d}`);
+      }
+      return `- ${parts.join(" ")}`;
+    },
+  });
+}
+
+export function formatRenameEdit(
+  result: LspRuntimeFileResult<WorkspaceEdit | null>,
+): LspToolResult<{ ok: boolean; serverId: string; rootDir: string; filePath: string; summary?: string; changes?: number; files?: string[]; error?: string }> {
+  if (!result.result) {
+    return success(`LSP rename for ${result.filePath} (${result.serverId}): No rename result.`, {
+      ok: true,
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+    });
+  }
+
+  const edit = result.result;
+  const changes = edit.changes ?? {};
+  const documentChanges = edit.documentChanges ?? [];
+  const fileUris = new Set([...Object.keys(changes), ...documentChanges.map((dc) => ("textDocument" in dc ? dc.textDocument.uri : ""))].filter(Boolean));
+  const totalChanges = Object.values(changes).reduce((sum, edits) => sum + edits.length, 0) +
+    documentChanges.reduce((sum, dc) => sum + ("edits" in dc ? dc.edits.length : 0), 0);
+
+  const fileList = [...fileUris].map((u) => {
+    try { return URI.parse(u).fsPath; } catch { return u; }
+  });
+  const lineCount = totalChanges;
+  const fileCount = fileList.length;
+
+  const lines = [
+    `LSP rename for ${result.filePath} (${result.serverId}):`,
+    `Renamed across ${fileCount} file(s) (${lineCount} occurrence(s)).`,
+    "",
+    "Files changed:",
+    ...fileList.map((f) => `- ${f}`),
+  ];
+
+  return success(lines.join("\n"), {
+    ok: true,
+    serverId: result.serverId,
+    rootDir: result.rootDir,
+    filePath: result.filePath,
+    summary: `Renamed across ${fileCount} file(s) (${lineCount} occurrence(s)).`,
+    changes: lineCount,
+    files: fileList,
+  });
+}
+
+export function formatImplementations(
+  result: LspRuntimeFileResult<Location | LocationLink[] | null>,
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<DisplayLocation>> {
+  const locations = normalizeDefinition(result.result).sort(compareLocations(result.filePath));
+  return formatPaginatedLocations("implementation", result, locations, cache, options.pageSize ?? 25);
+}
+
+export function formatTypeDefinition(
+  result: LspRuntimeFileResult<Location | LocationLink[] | null>,
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<DisplayLocation>> {
+  const locations = normalizeDefinition(result.result).sort(compareLocations(result.filePath));
+  return formatPaginatedLocations("type definition", result, locations, cache, options.pageSize ?? 25);
+}
+
+export function formatCallHierarchy(
+  result: LspRuntimeFileResult<CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null>,
+  direction: "incoming" | "outgoing",
+  cache?: LspResultCache,
+  options: FormatOptions = {},
+): LspToolResult<PageMetadata<NormalizedCallHierarchyItem>> {
+  const items = normalizeCallHierarchy(result.result, direction);
+  return paginateItems({
+    kind: "call_hierarchy",
+    title: `LSP call hierarchy (${direction}) for ${result.filePath} (${result.serverId}):`,
+    emptyText: `No LSP call hierarchy (${direction}) for ${result.filePath}.`,
+    items,
+    pageSize: options.pageSize ?? 50,
+    cache,
+    baseDetails: {
+      serverId: result.serverId,
+      rootDir: result.rootDir,
+      filePath: result.filePath,
+    },
+    formatItem: (item) => {
+      const indent = "  ".repeat(item.depth ?? 0);
+      const where = item.range ? ` ${formatRangeStart(item.range)}` : "";
+      const detail = item.detail ? ` — ${item.detail}` : "";
+      const path = item.filePath ? ` (${item.filePath}${where})` : where;
+      return `${indent}  ${direction === "incoming" ? "\u2190" : "\u2192"} ${item.name} (${item.kind})${detail}${path}`;
+    },
+  });
+}
+
+function normalizeCallHierarchy(
+  value: CallHierarchyIncomingCall[] | CallHierarchyOutgoingCall[] | null,
+  direction: "incoming" | "outgoing",
+): NormalizedCallHierarchyItem[] {
+  if (!value) return [];
+  return value.map((call, index) => {
+    const item = direction === "incoming" ? (call as CallHierarchyIncomingCall).from : (call as CallHierarchyOutgoingCall).to;
+    return {
+      name: item.name,
+      kind: symbolKindName(item.kind),
+      detail: item.detail,
+      filePath: uriToFilePath(item.uri),
+      range: item.selectionRange ? displayRange(item.selectionRange) : undefined,
+      depth: 0,
+    };
   });
 }
 
@@ -317,7 +584,7 @@ function chunk<T>(items: T[], size: number): T[][] {
 function normalizeDiagnostic(diagnostic: Diagnostic): NormalizedDiagnostic {
   return {
     severity: diagnosticSeverityName(diagnostic.severity),
-    message: diagnostic.message,
+    message: diagnosticMessageText(diagnostic.message),
     range: displayRange(diagnostic.range),
     ...(diagnostic.source ? { source: diagnostic.source } : {}),
     ...(diagnostic.code !== undefined ? { code: diagnostic.code } : {}),
@@ -381,6 +648,62 @@ function normalizeWorkspaceSymbolLocation(location: WorkspaceSymbol["location"])
   return { uri: location.uri, filePath: uriToFilePath(location.uri) };
 }
 
+function diagnosticMessageText(message: string | MarkupContent): string {
+  return typeof message === "string" ? message : message.value;
+}
+
+function normalizeCodeActions(actions: (CodeAction | Command)[]): NormalizedCodeAction[] {
+  return actions.map((action) => {
+    if ("title" in action && !("command" in action)) {
+      // CodeAction object
+      const codeAction = action as CodeAction;
+      const edit = codeAction.edit
+        ? {
+            changes: countEditChanges(codeAction.edit),
+            files: collectEditFiles(codeAction.edit),
+          }
+        : undefined;
+      return {
+        title: codeAction.title,
+        kind: codeAction.kind,
+        isPreferred: codeAction.isPreferred,
+        edit,
+        diagnostics: codeAction.diagnostics?.map((d) => diagnosticMessageText(d.message)),
+      };
+    }
+    // Command object
+    return { title: action.title };
+  });
+}
+
+function countEditChanges(edit: WorkspaceEdit): number {
+  const changes = edit.changes ?? {};
+  const documentChanges = edit.documentChanges ?? [];
+  const textEditCount = Object.values(changes).reduce((sum, edits) => sum + edits.length, 0);
+  const documentChangeCount = documentChanges.reduce(
+    (sum, dc) => sum + ("edits" in dc ? dc.edits.length : 0),
+    0,
+  );
+  return textEditCount + documentChangeCount;
+}
+
+function collectEditFiles(edit: WorkspaceEdit): string[] {
+  const uris = new Set<string>();
+  for (const uri of Object.keys(edit.changes ?? {})) {
+    uris.add(uri);
+  }
+  for (const dc of edit.documentChanges ?? []) {
+    if ("textDocument" in dc) uris.add(dc.textDocument.uri);
+  }
+  return [...uris].map((u) => {
+    try {
+      return URI.parse(u).fsPath;
+    } catch {
+      return u;
+    }
+  });
+}
+
 function hoverToText(hover: Hover): string {
   return markedContentToText(hover.contents).trim();
 }
@@ -420,6 +743,16 @@ function compareDiagnostics(a: NormalizedDiagnostic, b: NormalizedDiagnostic): n
   const severity = diagnosticSeverityRank(a.severity) - diagnosticSeverityRank(b.severity);
   if (severity !== 0) return severity;
   return a.range.start.line - b.range.start.line || a.range.start.column - b.range.start.column;
+}
+
+/** Sort raw Diagnostic[] the same way as compareDiagnostics sorts NormalizedDiagnostic[] */
+function compareRawDiagnostics(a: Diagnostic, b: Diagnostic): number {
+  const sevA = a.severity ?? 4;
+  const sevB = b.severity ?? 4;
+  if (sevA !== sevB) return sevA - sevB;
+  const lineDiff = a.range.start.line - b.range.start.line;
+  if (lineDiff !== 0) return lineDiff;
+  return a.range.start.character - b.range.start.character;
 }
 
 function diagnosticSeverityName(severity: Diagnostic["severity"]): string {

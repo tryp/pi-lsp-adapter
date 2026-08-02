@@ -8,18 +8,31 @@ import {
   type Disposable,
 } from "vscode-jsonrpc/node.js";
 import {
+  CallHierarchyIncomingCallsRequest,
+  CallHierarchyOutgoingCallsRequest,
+  CodeActionRequest,
   DefinitionRequest,
   DidChangeTextDocumentNotification,
   DidOpenTextDocumentNotification,
   ExitNotification,
   HoverRequest,
+  ImplementationRequest,
   InitializeRequest,
   InitializedNotification,
+  PrepareCallHierarchyRequest,
+  PrepareRenameRequest,
   PublishDiagnosticsNotification,
   ReferencesRequest,
+  RenameRequest,
   ShutdownRequest,
   DocumentSymbolRequest,
+  TypeDefinitionRequest,
   WorkspaceSymbolRequest,
+  type CallHierarchyIncomingCall,
+  type CallHierarchyItem,
+  type CallHierarchyOutgoingCall,
+  type CodeAction,
+  type Command,
   type Definition,
   type Diagnostic,
   type DocumentSymbol,
@@ -33,8 +46,10 @@ import {
   type SymbolInformation,
   type SymbolKind,
   type WorkspaceFolder,
+  type WorkspaceEdit,
   type WorkspaceSymbol,
 } from "vscode-languageserver-protocol";
+import type { PrepareRenameResult } from "vscode-languageserver-protocol";
 import { URI } from "vscode-uri";
 import { getLogsDir } from "../config/paths.js";
 import type { JsonObject, JsonValue, ResolvedServerConfig } from "../registry/schema.js";
@@ -229,6 +244,101 @@ export class LspClient {
     return this.request<SymbolInformation[] | WorkspaceSymbol[] | null>(WorkspaceSymbolRequest.method, { query });
   }
 
+  async codeAction(
+    uri: string,
+    line: number,
+    character: number,
+    context?: { diagnostics?: Diagnostic[]; only?: string[] },
+  ): Promise<(CodeAction | Command)[] | null> {
+    this.ensureCapability("code actions", this.capabilities?.codeActionProvider);
+    return this.request<(CodeAction | Command)[] | null>(CodeActionRequest.method, {
+      textDocument: { uri },
+      range: { start: { line, character }, end: { line, character } },
+      context: {
+        diagnostics: context?.diagnostics ?? [],
+        ...(context?.only ? { only: context.only } : {}),
+      },
+    });
+  }
+
+  async rename(
+    uri: string,
+    line: number,
+    character: number,
+    newName: string,
+  ): Promise<WorkspaceEdit | null> {
+    this.ensureCapability("rename", this.capabilities?.renameProvider);
+    return this.request<WorkspaceEdit | null>(RenameRequest.method, {
+      textDocument: { uri },
+      position: { line, character },
+      newName,
+    });
+  }
+
+  async prepareRename(
+    uri: string,
+    line: number,
+    character: number,
+  ): Promise<PrepareRenameResult | null> {
+    this.ensureCapability("rename", this.capabilities?.renameProvider);
+    return this.request<PrepareRenameResult | null>(PrepareRenameRequest.method, {
+      textDocument: { uri },
+      position: { line, character },
+    });
+  }
+
+  async implementation(
+    uri: string,
+    line: number,
+    character: number,
+  ): Promise<Location | LocationLink[] | null> {
+    this.ensureCapability("implementation", this.capabilities?.implementationProvider);
+    return this.request<Location | LocationLink[] | null>(ImplementationRequest.method, {
+      textDocument: { uri },
+      position: { line, character },
+    });
+  }
+
+  async typeDefinition(
+    uri: string,
+    line: number,
+    character: number,
+  ): Promise<Location | LocationLink[] | null> {
+    this.ensureCapability("type definition", this.capabilities?.typeDefinitionProvider);
+    return this.request<Location | LocationLink[] | null>(TypeDefinitionRequest.method, {
+      textDocument: { uri },
+      position: { line, character },
+    });
+  }
+
+  async prepareCallHierarchy(
+    uri: string,
+    line: number,
+    character: number,
+  ): Promise<CallHierarchyItem[] | null> {
+    this.ensureCapability("call hierarchy", this.capabilities?.callHierarchyProvider);
+    return this.request<CallHierarchyItem[] | null>(PrepareCallHierarchyRequest.method, {
+      textDocument: { uri },
+      position: { line, character },
+    });
+  }
+
+  async callHierarchyIncomingCalls(
+    item: CallHierarchyItem,
+  ): Promise<CallHierarchyIncomingCall[] | null> {
+    return this.request<CallHierarchyIncomingCall[] | null>(CallHierarchyIncomingCallsRequest.method, {
+      item,
+    });
+  }
+
+  async callHierarchyOutgoingCalls(
+    item: CallHierarchyItem,
+  ): Promise<CallHierarchyOutgoingCall[] | null> {
+    return this.request<CallHierarchyOutgoingCall[] | null>(CallHierarchyOutgoingCallsRequest.method, {
+      item,
+    });
+  }
+
   async shutdown(): Promise<boolean> {
     if (this.exited) {
       await this.processRegistry.unregister(this.id, this.pid);
@@ -286,6 +396,24 @@ export class LspClient {
       capabilities: {
         textDocument: {
           synchronization: { dynamicRegistration: false, willSave: false, willSaveWaitUntil: false, didSave: false },
+          codeAction: {
+            dynamicRegistration: false,
+            codeActionLiteralSupport: {
+              codeActionKind: {
+                valueSet: [
+                  "",
+                  "quickfix",
+                  "refactor",
+                  "refactor.extract",
+                  "refactor.inline",
+                  "refactor.rewrite",
+                  "source",
+                  "source.organizeImports",
+                ],
+              },
+            },
+            isPreferredSupport: true,
+          },
           hover: { dynamicRegistration: false, contentFormat: ["markdown", "plaintext"] },
           definition: { dynamicRegistration: false, linkSupport: true },
           references: { dynamicRegistration: false },
@@ -294,6 +422,7 @@ export class LspClient {
             hierarchicalDocumentSymbolSupport: true,
             symbolKind: { valueSet: supportedSymbolKinds() },
           },
+          rename: { dynamicRegistration: false, prepareSupport: true },
           publishDiagnostics: { relatedInformation: true, tagSupport: { valueSet: [1, 2] } },
         },
         workspace: {

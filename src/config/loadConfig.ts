@@ -18,12 +18,14 @@ export interface LoadLspConfigResult {
   warnings: string[];
   installMode: InstallMode;
   warmup: boolean;
+  extraWorkspaceRoots: string[];
 }
 
 interface RawLspConfig {
   installMode?: unknown;
   warmup?: unknown;
   servers?: unknown;
+  extraWorkspaceRoots?: unknown;
 }
 
 interface ConfigSource {
@@ -62,6 +64,7 @@ export async function loadLspConfig(input: LoadLspConfigInput): Promise<LoadLspC
   const catalog = deepClone(BUILTIN_CATALOG);
   let installMode: InstallMode = "prompt";
   let warmup = true;
+  let extraWorkspaceRoots: string[] = [];
   const projectRoot = input.projectRoot ?? input.cwd;
   const projectTrusted = await isProjectTrusted(projectRoot);
 
@@ -86,10 +89,11 @@ export async function loadLspConfig(input: LoadLspConfigInput): Promise<LoadLspC
 
     installMode = mergeInstallMode(installMode, config.installMode, source, projectRoot, warnings);
     warmup = mergeWarmup(warmup, config.warmup, source, projectRoot, warnings);
+    extraWorkspaceRoots = mergeExtraWorkspaceRoots(extraWorkspaceRoots, config.extraWorkspaceRoots, source, projectRoot, warnings);
     mergeServers(catalog, config.servers, source, projectRoot, warnings);
   }
 
-  return { catalog, warnings, installMode, warmup };
+  return { catalog, warnings, installMode, warmup, extraWorkspaceRoots };
 }
 
 async function readConfig(source: ConfigSource, warnings: string[]): Promise<RawLspConfig | undefined> {
@@ -166,6 +170,36 @@ function mergeWarmup(
 
   warnings.push(`Ignoring invalid warmup in ${source.label} at ${source.path}: expected true or false.`);
   return current;
+}
+
+function mergeExtraWorkspaceRoots(
+  current: string[],
+  value: unknown,
+  source: ConfigSource,
+  _projectRoot: string,
+  warnings: string[],
+): string[] {
+  if (value === undefined) return current;
+
+  if (!Array.isArray(value)) {
+    warnings.push(
+      `Ignoring invalid extraWorkspaceRoots in ${source.label} at ${source.path}: expected an array of strings.`,
+    );
+    return current;
+  }
+
+  const resolved: string[] = [...current];
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      warnings.push(
+        `Ignoring invalid extraWorkspaceRoot entry in ${source.label} at ${source.path}: each entry must be a string.`,
+      );
+      continue;
+    }
+    resolved.push(entry);
+  }
+
+  return resolved;
 }
 
 function mergeServers(
