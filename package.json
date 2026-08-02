@@ -34,7 +34,9 @@
   ],
   "scripts": {
     "lint": "eslint .",
-    "test": "vitest run",
+    "test": "npm run test:vitest && npm run test:node",
+    "test:vitest": "vitest run",
+    "test:node": "../pi-mono/node_modules/.bin/tsx --test tests/*.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
