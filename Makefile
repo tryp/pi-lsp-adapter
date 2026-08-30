@@ -1,17 +1,19 @@
-# pi-lsp-adapter extension — source-deployed
+# pi-lsp-adapter deployment helpers.
 #
-# pi loads pi-lsp-adapter directly from ~/src/pi-lsp-adapter (TypeScript source via tsgo).
-# Changes to source take effect immediately — no deploy step needed.
-# The deploy target exists as a backup/archive copy to the npm location.
+# This checkout is the source of truth. Pi loads the deployed npm-location
+# mirror, not ~/src/pi-lsp-adapter. Never edit the runtime copy directly;
+# commit source changes, run `make deploy`, and restart/reload Pi as needed.
 #
 # Usage:
 #   make test        # run interface tests
-#   make smoke-test  # quick-check extension loads in a real pi session
-#   make deploy      # backup copy to npm location (not required)
-#   make verify      # check deploy matches source
+#   make smoke-test  # load only the deployed extension in a fresh pi
+#   make deploy      # copy, stamp, verify, and smoke-test
+#   make verify      # verify source/runtime content and deployment stamp
 
-RUNTIME = $(HOME)/.pi/agent/npm/node_modules/pi-lsp-adapter
+RUNTIME ?= $(HOME)/.pi/agent/npm/node_modules/pi-lsp-adapter
 SOURCE = $(HOME)/src/pi-lsp-adapter
+SMOKE_SCRIPT ?= /home/dev/src/pi-session-analysis/scripts/predeploy_smoke.py
+SMOKE_TIMEOUT ?= 90
 
 .PHONY: deploy verify link-packages link-pi-deps test test-all smoke-test
 
@@ -37,7 +39,7 @@ link-pi-deps:  ## Ensure pi-lsp-adapter's npm deps are resolvable from pi's exte
 	done
 	@echo "Verifying resolution..."
 	@for pkg in vscode-uri vscode-jsonrpc/node.js vscode-languageserver-protocol vscode-languageserver-types; do \
-	  node -e "try { require.resolve('$$pkg', { paths: ['/home/dev/.pi/local/pi-coding-agent/dist/core/extensions'] }); console.log('  OK: ' + '$$pkg'); } catch(e) { console.log('  FAIL: ' + '$$pkg: ' + e.message); }" 2>&1; \
+	  node -e "require.resolve('$$pkg', { paths: ['/home/dev/.pi/local/pi-coding-agent/dist/core/extensions'] }); console.log('  OK: ' + '$$pkg')" || exit 1; \
 	done
 
 TSX = /home/dev/src/pi-mono/node_modules/.bin/tsx
@@ -47,35 +49,36 @@ test: link-packages link-pi-deps  ## Run all tests
 
 test-all: test smoke-test  ## Run all tests
 
-smoke-test:  ## Check extension loads in a real pi session
-	@echo "Smoke testing pi-lsp-adapter extension in pi..."
-	@rm -f /tmp/pi-lsp-smoke.jsonl
-	@(timeout 120 pi --mode json --no-session -p "list your available tools" > /tmp/pi-lsp-smoke.jsonl 2>&1) &
-	@PID=$$!; \
-	  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
-	    if grep -q 'lsp_diagnostics' /tmp/pi-lsp-smoke.jsonl 2>/dev/null; then \
-	      echo "  OK: lsp_diagnostics tool found in pi output"; \
-	      kill $$PID 2>/dev/null; exit 0; \
-	    fi; \
-	    sleep 2; \
-	  done; \
-	  echo "  WARN: pi not responding — check /tmp/pi-lsp-smoke.jsonl"; \
-	  kill $$PID 2>/dev/null; exit 1
-
-deploy: ## Backup copy to npm location (not required — pi loads from source)
-	@echo "Backing up pi-lsp-adapter to $(RUNTIME)..."
+deploy: ## Copy this checkout, verify it, and smoke-test the deployed extension
+	@test -z "$$(git status --porcelain)" || { echo "ERROR: commit source changes before deploying" >&2; git status --short >&2; exit 1; }
+	@test -d "$(RUNTIME)" || mkdir -p "$(RUNTIME)"
+	@echo "Deploying pi-lsp-adapter to $(RUNTIME)..."
 	cp "$(SOURCE)/package.json" "$(RUNTIME)/package.json"
-	cp "$(SOURCE)/README.md" "$(RUNTIME)/README.md" 2>/dev/null || true
-	cp "$(SOURCE)/LICENSE" "$(RUNTIME)/LICENSE" 2>/dev/null || true
+	cp "$(SOURCE)/package-lock.json" "$(RUNTIME)/package-lock.json"
+	cp "$(SOURCE)/README.md" "$(RUNTIME)/README.md"
+	cp "$(SOURCE)/LICENSE" "$(RUNTIME)/LICENSE"
 	rm -rf "$(RUNTIME)/src"
 	cp -a "$(SOURCE)/src" "$(RUNTIME)/src"
-	# Don't overwrite node_modules — it's managed by npm in the runtime
-	@echo "Done. Verify with 'make verify'"
+	@printf 'deployed from: %s\nbranch: %s\ncommit: %s\ndeployed at: %s\n\nThis is a deployed artifact. Do not edit files here.\nEdit the source checkout and run `make deploy`.\n' \
+		"$(SOURCE)" "$$(git -C "$(SOURCE)" rev-parse --abbrev-ref HEAD)" "$$(git -C "$(SOURCE)" rev-parse HEAD)" "$$(date '+%Y-%m-%d %H:%M:%S %z')" \
+		> "$(RUNTIME)/.deployed-commit"
+	@$(MAKE) --no-print-directory verify
+	@$(MAKE) --no-print-directory smoke-test
 
-verify: ## Check deployed files match source
-	@echo "Verifying pi-lsp-adapter deploy..."
-	@diff -q "$(SOURCE)/src/index.ts" "$(RUNTIME)/src/index.ts" && \
-	  echo "  src/index.ts: OK" || echo "  src/index.ts: MISMATCH"
-	@diff -q "$(SOURCE)/package.json" "$(RUNTIME)/package.json" && \
-	  echo "  package.json: OK" || echo "  package.json: MISMATCH"
-	@echo "Verify complete"
+verify: ## Check deployed files, dependencies, and source commit
+	@test -d "$(RUNTIME)" || { echo "ERROR: $(RUNTIME) missing" >&2; exit 1; }
+	@test -f "$(RUNTIME)/.deployed-commit" || { echo "ERROR: no .deployed-commit marker" >&2; exit 1; }
+	@test "$$(sed -n 's/^commit: //p' "$(RUNTIME)/.deployed-commit")" = "$$(git -C "$(SOURCE)" rev-parse HEAD)" || { echo "ERROR: deployed commit != source HEAD" >&2; exit 1; }
+	@diff -qr "$(SOURCE)/src" "$(RUNTIME)/src" >/dev/null || { echo "ERROR: deployed source drift" >&2; exit 1; }
+	@cmp -s "$(SOURCE)/package.json" "$(RUNTIME)/package.json" || { echo "ERROR: deployed package.json drift" >&2; exit 1; }
+	@cmp -s "$(SOURCE)/package-lock.json" "$(RUNTIME)/package-lock.json" || { echo "ERROR: deployed package-lock.json drift" >&2; exit 1; }
+	@node -e "for (const p of ['typebox','vscode-uri','vscode-jsonrpc/node.js','vscode-languageserver-protocol','vscode-languageserver-types']) require.resolve(p, {paths: ['$(RUNTIME)']}); console.log('OK: runtime dependencies resolve')"
+	@echo "OK: $(RUNTIME) matches $(SOURCE) @ $$(git -C "$(SOURCE)" rev-parse --short HEAD)"
+
+smoke-test: ## Load only the deployed extension in a fresh pi process
+	python3 "$(SMOKE_SCRIPT)" --extension "$(RUNTIME)/src/index.ts" --tool lsp_list_workspace_roots \
+		--timeout "$(SMOKE_TIMEOUT)" \
+		--prompt 'Call lsp_list_workspace_roots, report that it loaded, and stop.'
+
+deployed-commit: ## Show which source commit is deployed
+	@cat "$(RUNTIME)/.deployed-commit" 2>/dev/null || echo "no .deployed-commit marker"
