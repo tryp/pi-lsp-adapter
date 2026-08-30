@@ -171,6 +171,23 @@ Do not edit these by hand unless you are debugging or cleaning up state:
 
 Do not put extension source code under `~/.pi/agent/lsp/`; that directory is only for runtime state.
 
+### Local deployment
+
+For a local development checkout, keep Pi pointed at the deployed package
+mirror, not at `~/src/pi-lsp-adapter`:
+
+```bash
+cd ~/src/pi-lsp-adapter
+make test
+make deploy       # copy, verify dependencies and commit stamp, then smoke-test
+make verify       # independently check the deployed mirror
+```
+
+`make deploy` runs a fresh pi process with only the deployed extension enabled.
+It verifies tool registration and reaches `agent_end`, so extension-load errors
+and incompatible host APIs fail before normal sessions use the change. Do not
+replace it with a hand-written `rsync --delete`.
+
 ### Top-level config fields
 
 | Field         | Default    | Behavior                                                                                       |
