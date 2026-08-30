@@ -187,19 +187,26 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
 export type GetLspToolState = () => LspExtensionState | null;
 
 function registerToolPromptGuidelines(pi: ExtensionAPI): void {
-  pi.registerToolPromptGuidelines("read", [
+  const register = (
+    pi as ExtensionAPI & {
+      registerToolPromptGuidelines?: (toolName: string, guidelines: string[]) => void;
+    }
+  ).registerToolPromptGuidelines;
+  if (typeof register !== "function") return;
+
+  register.call(pi, "read", [
     "To get file structure use lsp_document_symbols first — returns tree with line numbers, no file content. After calling it, do NOT read the same file for structure — the tree is complete.",
     "To get type/signature/docs use lsp_hover on the identifier. Do NOT read the surrounding code block — hover returns full type info compactly.",
     "To find where a symbol is defined use lsp_definition on the identifier instead of grep + read.",
     "To check for lint/type errors use lsp_diagnostics first instead of reading the whole file. Only read specific flagged lines.",
   ]);
-  pi.registerToolPromptGuidelines("grep", [
+  register.call(pi, "grep", [
     "To find ALL usages of a symbol across the workspace use lsp_references — returns file:line:col directly, no grep needed.",
     "To find where a symbol is defined use lsp_definition on the identifier — exact file:line:col, more reliable than grep.",
     "To search for functions, classes, or other symbols by name without knowing file paths use lsp_workspace_symbols with kind=\"function,class,method\" etc.",
     "To find symbols by partial name across all file types use lsp_workspace_symbols instead of grep — returns typed results with file:line locations.",
   ]);
-  pi.registerToolPromptGuidelines("remind", [
+  register.call(pi, "remind", [
     "When checking on a background job, use bash_bg with remindDelay instead of manual remind() — the callback auto-cancels if the job completes before the timer fires.",
     "Use manual remind() only for standalone reminders that aren't linked to a job.",
   ]);
