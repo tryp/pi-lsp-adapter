@@ -11,6 +11,7 @@ docs/superpowers/
 coverage/
 .vitest/
 npm-audit.json
+tmp/
 
 # macOS
 .DS_Store
