@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  DidChangeTextDocumentNotification,
   DidOpenTextDocumentNotification,
   HoverRequest,
   InitializeRequest,
@@ -368,6 +369,39 @@ describe("cachedDiagnostics (pre-edit baseline)", () => {
     expect(runtime.cachedDiagnostics("src/index.ts")).toBeUndefined();
   });
 
+  it("does not return a stale version-less publication cached before the sync", async () => {
+    // The exact regression the version-less fallback can introduce: a server
+    // that never sends `version` already published for this uri, so a naive
+    // "any publication is good enough" check would return that OLD result
+    // immediately after the edit and report pre-edit errors as new.
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const stale = "cached from an earlier sync";
+    const fresh = "published after this sync";
+    const published: string[] = [];
+    const runtime = runtimeManager({
+      diagnosticsWaitMs: 2500,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, {
+          // Publish an initial (stale) set on didOpen, then a fresh set on a
+          // later didChange, with no version field in either.
+          publishMessages: [stale, fresh],
+          publishDelayMs: 80,
+        }),
+    });
+
+    // First call opens the document and caches the STALE publication.
+    await runtime.diagnostics("src/index.ts");
+
+    // Second call re-syncs (content differs) and must NOT settle for the
+    // stale publication still sitting in the cache.
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 2;\n", "utf8");
+    const result = await runtime.diagnostics("src/index.ts");
+
+    expect(result.diagnostics[0]?.message).toBe(fresh);
+  });
+
   it("prefers the client whose root actually contains the file", async () => {
     // A file covered by more than one live client must not pick up another
     // client's diagnostics. The most specific (longest) matching root wins.
@@ -420,6 +454,7 @@ class FakeConnection implements LspConnection {
     private readonly publishOptions: {
       publishDelayMs?: number;
       publishVersion?: number;
+      publishMessages?: string[];
     } = {},
   ) {}
 
@@ -437,28 +472,42 @@ class FakeConnection implements LspConnection {
 
   async sendNotification(method: string, params?: unknown): Promise<void> {
     this.notifications.push({ method, params });
-    if (method === DidOpenTextDocumentNotification.method && isDidOpenParams(params)) {
-      const publish = () =>
-        this.notificationHandlers.get(PublishDiagnosticsNotification.method)?.({
-          uri: params.textDocument.uri,
-          diagnostics: [
-            {
-              range: { start: { line: 0, character: 6 }, end: { line: 0, character: 11 } },
-              severity: 1,
-              message: "Type mismatch",
-              source: `fake-${this.pid}`,
-            },
-          ],
-          // Servers may omit `version`; only include it when configured.
-          ...(this.publishOptions.publishVersion === undefined
-            ? {}
-            : { version: this.publishOptions.publishVersion }),
-        });
-
-      const delayMs = this.publishOptions.publishDelayMs ?? 0;
-      if (delayMs > 0) setTimeout(publish, delayMs);
-      else publish();
+    if (!isDidOpenParams(params)) return;
+    if (
+      method !== DidOpenTextDocumentNotification.method &&
+      method !== DidChangeTextDocumentNotification.method
+    ) {
+      return;
     }
+
+    // A scripted sequence lets a test give distinct diagnostics to successive
+    // publications, which is how a stale cached publication is detected.
+    const messages = this.publishOptions.publishMessages;
+    const message =
+      messages && messages.length > 0
+        ? (messages.shift() as string)
+        : "Type mismatch";
+
+    const publish = () =>
+      this.notificationHandlers.get(PublishDiagnosticsNotification.method)?.({
+        uri: params.textDocument.uri,
+        diagnostics: [
+          {
+            range: { start: { line: 0, character: 6 }, end: { line: 0, character: 11 } },
+            severity: 1,
+            message,
+            source: `fake-${this.pid}`,
+          },
+        ],
+        // Servers may omit `version`; only include it when configured.
+        ...(this.publishOptions.publishVersion === undefined
+          ? {}
+          : { version: this.publishOptions.publishVersion }),
+      });
+
+    const delayMs = this.publishOptions.publishDelayMs ?? 0;
+    if (delayMs > 0) setTimeout(publish, delayMs);
+    else publish();
   }
 
   onNotification(method: string, handler: (params: unknown) => void): Disposable {

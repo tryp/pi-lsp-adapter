@@ -248,4 +248,65 @@ describe("auto-diag baseline handling", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
   });
+  it("works for the write tool, not only edit", async () => {
+    const state = fakeState({
+      cachedDiagnostics: () => [],
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(2, "new from write")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+
+    handlers.get("tool_call")!({
+      toolName: "write", toolCallId: "w1", input: { path: "/repo/new.py" },
+    } as never);
+    await handlers.get("tool_result")!({
+      toolName: "write", toolCallId: "w1", input: { path: "/repo/new.py" }, isError: false,
+    } as never);
+
+    expect(autoDiagBody(sendMessage)).toContain("1 new error");
+  });
+
+  it("does not throw when a tool result carries no input", async () => {
+    const state = fakeState({ cachedDiagnostics: () => [] });
+    const { handlers, sendMessage } = setup(state);
+
+    await expect(
+      handlers.get("tool_result")!({
+        toolName: "edit", toolCallId: "n1", isError: false,
+      } as never) as Promise<unknown>,
+    ).resolves.toBeUndefined();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps concurrent edits to one file isolated by tool call id", async () => {
+    // Two edits in flight on the same path must each diff against their OWN
+    // baseline; sharing one would attribute errors to the wrong edit.
+    let cache = [diag(1, "before both")];
+    const state = fakeState({
+      cachedDiagnostics: () => [...cache],
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(1, "before both"), diag(9, "added")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+
+    handlers.get("tool_call")!(editCall("a1", "/repo/x.py"));
+    cache = [];
+    handlers.get("tool_call")!(editCall("a2", "/repo/x.py"));
+
+    await handlers.get("tool_result")!(editResult("a1", "/repo/x.py"));
+    const first = autoDiagBody(sendMessage);
+    expect(first).toContain("1 new error");
+    expect(first).not.toContain("before both");
+
+    sendMessage.mockClear();
+    await handlers.get("tool_result")!(editResult("a2", "/repo/x.py"));
+    // a2 captured an empty baseline, so both errors are new for that call.
+    expect(autoDiagBody(sendMessage)).toContain("2 new error");
+  });
 });

@@ -341,7 +341,7 @@ export class LspRuntimeManager {
 
   async diagnostics(filePath: string): Promise<LspDiagnosticsResult> {
     const target = await this.prepareFileTarget(filePath);
-    await this.waitForPublishedDiagnostics(target.client, target.uri);
+    await this.waitForPublishedDiagnostics(target.client, target.uri, target.seqBeforeSync);
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -357,30 +357,42 @@ export class LspRuntimeManager {
    *
    * A fixed delay is a guess: too short reads the previous version's
    * diagnostics (already-fixed errors reported as new), too long wastes a
-   * turn. When the server reports versions we can wait for the one we asked
-   * for. Servers may omit `version` on publishDiagnostics, so fall back to
-   * the fixed delay rather than spinning on a value that will never arrive.
+   * turn. Two signals let us do better than guessing, in order of precision:
+   *
+   *  1. The document version the server echoes on `publishDiagnostics`, when
+   *     it sends one. Anything below the version we synced is the previous
+   *     edit's answer.
+   *  2. The client's own publication counter, sampled before the sync. Servers
+   *     may omit `version` entirely (it is optional in the protocol), so this
+   *     is what distinguishes "published in response to my sync" from
+   *     "published some time ago". Without it, a version-less server would
+   *     return a stale publication immediately.
+   *
+   * If neither signal can advance (no client version, no publication at all),
+   * fall back to the fixed delay rather than spinning on a value that will
+   * never arrive.
    */
   private async waitForPublishedDiagnostics(
     client: LspClient,
     uri: string,
+    seqBeforeSync: number,
   ): Promise<void> {
     const syncedVersion = client.getDocumentVersion(uri);
+    const deadline = performance.now() + this.diagnosticsWaitMs;
 
     if (syncedVersion === undefined) {
       await delay(this.diagnosticsWaitMs);
       return;
     }
 
-    const deadline = performance.now() + this.diagnosticsWaitMs;
-    for (;;) {
+    const arrived = () => {
+      const publishedSeq = client.getPublishedSeq(uri);
+      if (publishedSeq !== undefined && publishedSeq > seqBeforeSync) return true;
       const publishedVersion = client.getPublishedVersion(uri);
-      // A version-less publication cannot be matched to our sync; treat any
-      // publication as the best answer available and let the caller read it.
-      if (publishedVersion === undefined && client.getPublishedDiagnostics(uri) !== undefined) {
-        return;
-      }
-      if (publishedVersion !== undefined && publishedVersion >= syncedVersion) return;
+      return publishedVersion !== undefined && publishedVersion >= syncedVersion;
+    };
+
+    while (!arrived()) {
       const remaining = deadline - performance.now();
       if (remaining <= 0) return;
       await delay(Math.min(25, Math.max(1, remaining)));
@@ -952,7 +964,7 @@ export class LspRuntimeManager {
 
   private async prepareFileTarget(
     filePath: string,
-  ): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  ): Promise<SelectedServer & { client: LspClient; uri: string; seqBeforeSync: number }> {
     const selected = await this.selectServerForFile(filePath);
     return this.attachClient(selected);
   }
@@ -969,19 +981,24 @@ export class LspRuntimeManager {
 
   private async attachClient(
     selected: SelectedServer,
-  ): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  ): Promise<SelectedServer & { client: LspClient; uri: string; seqBeforeSync: number }> {
     const target = await this.ensureClient({
       server: selected.server,
       rootDir: selected.rootDir,
       rootMarker: selected.rootMarker,
       allowPromptInstall: false,
     });
+    // Sample the publication counter immediately before syncing: any
+    // publication with a higher sequence arrived as a result of this sync and
+    // therefore describes the content we are about to report on. Servers that
+    // omit the optional `version` field cannot be matched by version alone.
+    const seqBeforeSync = target.client.getPublicationSeq();
     const uri = await target.client.syncFile(
       selected.filePath,
       selected.filetype,
       selected.text,
     );
-    return { ...selected, client: target.client, uri };
+    return { ...selected, client: target.client, uri, seqBeforeSync };
   }
 
   private async selectServerForFile(filePath: string): Promise<SelectedServer> {

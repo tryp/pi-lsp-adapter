@@ -84,7 +84,7 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     // Clear the pending baseline on EVERY result path. Failed or blocked edits
     // are common, and leaving their entry behind would grow this module-global
     // map for the lifetime of the session.
-    const resultPath = (event.input as { path?: string }).path;
+    const resultPath = (event.input as { path?: string } | undefined)?.path;
     const resultKey =
       resultPath && event.toolCallId ? `${event.toolCallId}:${resultPath}` : undefined;
     const before = resultKey ? pendingBeforeDiags.get(resultKey) : undefined;

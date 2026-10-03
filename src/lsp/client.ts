@@ -115,7 +115,8 @@ export class LspClient {
   private readonly pid: number;
   private readonly process: LspServerProcess;
   private readonly connection: LspConnection;
-  private readonly diagnosticsByUri = new Map<string, { diagnostics: Diagnostic[]; version?: number }>();
+  private readonly diagnosticsByUri = new Map<string, { diagnostics: Diagnostic[]; version?: number; seq: number }>();
+  private publicationSeq = 0;
   private readonly documents = new Map<string, LspClientDocument>();
   private readonly disposables: Disposable[] = [];
   private capabilities: ServerCapabilities | undefined;
@@ -207,6 +208,23 @@ export class LspClient {
 
   getPublishedDiagnostics(uri: string): Diagnostic[] | undefined {
     return this.diagnosticsByUri.get(uri)?.diagnostics;
+  }
+
+  /**
+   * Monotonic counter incremented on every publication, regardless of uri.
+   *
+   * Servers may omit the optional `version` field, so a caller cannot tell
+   * from the diagnostics alone whether a publication arrived after its own
+   * sync or predates it. Sampling this before a sync and comparing afterwards
+   * gives that guarantee without relying on the server.
+   */
+  getPublicationSeq(): number {
+    return this.publicationSeq;
+  }
+
+  /** Sequence number of the publication currently cached for a uri. */
+  getPublishedSeq(uri: string): number | undefined {
+    return this.diagnosticsByUri.get(uri)?.seq;
   }
 
   hasDocument(uri: string): boolean {
@@ -456,7 +474,11 @@ export class LspClient {
     this.disposables.push(
       this.connection.onNotification(PublishDiagnosticsNotification.method, (params) => {
         if (!isPublishDiagnosticsParams(params)) return;
-        this.diagnosticsByUri.set(params.uri, { diagnostics: params.diagnostics, version: params.version });
+        this.diagnosticsByUri.set(params.uri, {
+          diagnostics: params.diagnostics,
+          version: params.version,
+          seq: ++this.publicationSeq,
+        });
       }),
     );
 
