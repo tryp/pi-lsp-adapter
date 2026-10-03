@@ -100,6 +100,16 @@ export interface LspDiagnosticsResult {
   filePath: string;
   uri: string;
   diagnostics: Diagnostic[];
+  /**
+   * Whether the server published diagnostics for the synced version before
+   * we gave up waiting.
+   *
+   * `diagnostics: []` is ambiguous on its own: it means either "this file is
+   * clean" or "nothing has been published yet". Callers that diff diagnostics
+   * must check this, or a slow server makes every pre-existing error look
+   * newly introduced.
+   */
+  published: boolean;
 }
 
 export class LspClient {

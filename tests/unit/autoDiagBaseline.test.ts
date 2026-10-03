@@ -71,7 +71,8 @@ function fakeState(options: {
           codeActions: null,
           diagnosticActions: [],
         })),
-      diagnostics: options.diagnostics ?? (async () => ({ diagnostics: [] })),
+      diagnostics:
+        options.diagnostics ?? (async () => ({ diagnostics: [], published: true })),
     } as never,
   };
 }
@@ -93,12 +94,13 @@ function autoDiagBody(sendMessage: ReturnType<typeof vi.fn>): string | undefined
 }
 
 describe("auto-diag baseline handling", () => {
-  it("does not steer when no pre-edit baseline was captured", async () => {
-    // No live client for this file -> cachedDiagnostics returns undefined.
-    // Before the fix, `before ?? []` made the diff treat the file as clean
-    // and report every existing error as newly introduced.
+  it("ignores diagnostics when the server published nothing before the wait expired", async () => {
+    // A slow server yields `diagnostics: []` with published=false. Treating
+    // that as a clean baseline would blame every pre-existing error on this
+    // edit - the original defect.
     const state = fakeState({
       cachedDiagnostics: () => undefined,
+      diagnostics: async () => ({ diagnostics: [], published: false }),
       diagnosticsWithFixes: async () => ({
         diagnostics: { diagnostics: [diag(3, "pre-existing error")] },
         codeActions: null,
@@ -107,10 +109,76 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!(editCall("c1", "/repo/a.py"));
+    await handlers.get("tool_call")!(editCall("slow", "/repo/slow.py"));
+    await handlers.get("tool_result")!(editResult("slow", "/repo/slow.py"));
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("steers when the server published an empty set and the edit adds an error", async () => {
+    // published=true with [] is a genuine "file was clean" baseline, and a
+    // new error must still be reported.
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: async () => ({ diagnostics: [], published: true }),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(5, "introduced")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+
+    await handlers.get("tool_call")!(editCall("clean", "/repo/clean.py"));
+    await handlers.get("tool_result")!(editResult("clean", "/repo/clean.py"));
+
+    expect(autoDiagBody(sendMessage)).toContain("1 new error");
+    expect(autoDiagBody(sendMessage)).toContain("introduced");
+  });
+
+  it("does not steer when starting a baseline client fails", async () => {
+    // No live client for this file -> cachedDiagnostics returns undefined.
+    // Before the fix, `before ?? []` made the diff treat the file as clean
+    // and report every existing error as newly introduced.
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: async () => { throw new Error("no server"); },
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(3, "pre-existing error")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+
+    await handlers.get("tool_call")!(editCall("c1", "/repo/a.py"));
     await handlers.get("tool_result")!(editResult("c1", "/repo/a.py"));
 
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses awaited diagnostics as the first-edit baseline and steers on a new error", async () => {
+    const diagnostics = vi.fn(async () => ({
+      diagnostics: [diag(2, "existing")],
+      published: true,
+    }));
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics,
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(2, "existing"), diag(8, "introduced")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+
+    await handlers.get("tool_call")!(editCall("first", "/repo/first.py"));
+    expect(diagnostics).toHaveBeenCalledWith("/repo/first.py");
+    await handlers.get("tool_result")!(editResult("first", "/repo/first.py"));
+
+    expect(autoDiagBody(sendMessage)).toContain("introduced");
+    expect(autoDiagBody(sendMessage)).not.toContain("existing");
   });
 
   it("steers when an explicit empty baseline gains a new error", async () => {
@@ -125,7 +193,7 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!(editCall("c2", "/repo/b.py"));
+    await handlers.get("tool_call")!(editCall("c2", "/repo/b.py"));
     await handlers.get("tool_result")!(editResult("c2", "/repo/b.py"));
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -144,7 +212,7 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!(editCall("c3", "/repo/c.py"));
+    await handlers.get("tool_call")!(editCall("c3", "/repo/c.py"));
     await handlers.get("tool_result")!(editResult("c3", "/repo/c.py"));
 
     expect(sendMessage).not.toHaveBeenCalled();
@@ -163,7 +231,7 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!(editCall("c4", "/repo/d.py"));
+    await handlers.get("tool_call")!(editCall("c4", "/repo/d.py"));
     await handlers.get("tool_result")!(editResult("c4", "/repo/d.py"));
 
     const body = autoDiagBody(sendMessage);
@@ -173,8 +241,10 @@ describe("auto-diag baseline handling", () => {
   });
 
   it("stays silent when auto-diag is disabled", async () => {
+    const diagnostics = vi.fn(async () => ({ diagnostics: [], published: true }));
     const state = fakeState({
-      cachedDiagnostics: () => [],
+      cachedDiagnostics: () => undefined,
+      diagnostics,
       diagnosticsWithFixes: async () => ({
         diagnostics: { diagnostics: [diag(1, "err")] },
         codeActions: null,
@@ -183,10 +253,11 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state, { autoDiag: false });
 
-    handlers.get("tool_call")!(editCall("c5", "/repo/e.py"));
+    await handlers.get("tool_call")!(editCall("c5", "/repo/e.py"));
     await handlers.get("tool_result")!(editResult("c5", "/repo/e.py"));
 
     expect(sendMessage).not.toHaveBeenCalled();
+    expect(diagnostics).not.toHaveBeenCalled();
   });
 
   it("uses the baseline captured at tool_call, not a later cache state", async () => {
@@ -203,7 +274,7 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!(editCall("c6", "/repo/f.py"));
+    await handlers.get("tool_call")!(editCall("c6", "/repo/f.py"));
 
     // The cache changes after the baseline was taken (as it would once the
     // edit lands and the server republishes).
@@ -233,7 +304,7 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!(editCall("c7", "/repo/g.py"));
+    await handlers.get("tool_call")!(editCall("c7", "/repo/g.py"));
 
     await handlers.get("tool_result")!({
       toolName: "edit", toolCallId: "c7", input: { path: "/repo/g.py" }, isError: true,
@@ -259,7 +330,7 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!({
+    await handlers.get("tool_call")!({
       toolName: "write", toolCallId: "w1", input: { path: "/repo/new.py" },
     } as never);
     await handlers.get("tool_result")!({
@@ -295,9 +366,9 @@ describe("auto-diag baseline handling", () => {
     });
     const { handlers, sendMessage } = setup(state);
 
-    handlers.get("tool_call")!(editCall("a1", "/repo/x.py"));
+    await handlers.get("tool_call")!(editCall("a1", "/repo/x.py"));
     cache = [];
-    handlers.get("tool_call")!(editCall("a2", "/repo/x.py"));
+    await handlers.get("tool_call")!(editCall("a2", "/repo/x.py"));
 
     await handlers.get("tool_result")!(editResult("a1", "/repo/x.py"));
     const first = autoDiagBody(sendMessage);

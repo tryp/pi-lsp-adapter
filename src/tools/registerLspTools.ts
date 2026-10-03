@@ -66,7 +66,7 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
   });
 
   // Snapshot pre-mutation diagnostics so we can diff post-mutation.
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", async (event) => {
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const filePath = event.input.path;
     if (!filePath || typeof filePath !== "string") return;
@@ -75,8 +75,28 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     if (!state) return;
 
     const cacheKey = `${event.toolCallId}:${filePath}`;
+    if (!pi.getFlag("auto-diag")) return;
+
     const cached = state.runtimeManager.cachedDiagnostics(filePath);
-    pendingBeforeDiags.set(cacheKey, { diagnostics: cached ?? null });
+    if (cached !== undefined) {
+      pendingBeforeDiags.set(cacheKey, { diagnostics: cached });
+      return;
+    }
+
+    try {
+      // Starting a client here is deliberate: it is the only way to have an
+      // accurate pre-edit baseline for a file nothing has opened yet, and the
+      // edit is allowed to wait for it.
+      const result = await state.runtimeManager.diagnostics(filePath);
+      // `diagnostics: []` means either "clean" or "nothing published yet".
+      // Recording the latter as a baseline would blame every pre-existing
+      // error on this edit, so require an actual publication.
+      pendingBeforeDiags.set(cacheKey, {
+        diagnostics: result.published ? result.diagnostics : null,
+      });
+    } catch {
+      pendingBeforeDiags.set(cacheKey, { diagnostics: null });
+    }
   });
 
   // Compare post-mutation diagnostics against cached pre-state; steer on new errors.

@@ -341,13 +341,18 @@ export class LspRuntimeManager {
 
   async diagnostics(filePath: string): Promise<LspDiagnosticsResult> {
     const target = await this.prepareFileTarget(filePath);
-    await this.waitForPublishedDiagnostics(target.client, target.uri, target.seqBeforeSync);
+    const published = await this.waitForPublishedDiagnostics(
+      target.client,
+      target.uri,
+      target.seqBeforeSync,
+    );
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
       filePath: target.filePath,
       uri: target.uri,
       diagnostics: target.client.getDiagnostics(target.uri),
+      published,
     };
   }
 
@@ -376,13 +381,13 @@ export class LspRuntimeManager {
     client: LspClient,
     uri: string,
     seqBeforeSync: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const syncedVersion = client.getDocumentVersion(uri);
     const deadline = performance.now() + this.diagnosticsWaitMs;
 
     if (syncedVersion === undefined) {
       await delay(this.diagnosticsWaitMs);
-      return;
+      return client.getPublishedSeq(uri) !== undefined;
     }
 
     const arrived = () => {
@@ -394,9 +399,12 @@ export class LspRuntimeManager {
 
     while (!arrived()) {
       const remaining = deadline - performance.now();
-      if (remaining <= 0) return;
+      // Report the truth on timeout: the caller must not treat an
+      // unpublished (or stale) cache as "this file is clean".
+      if (remaining <= 0) return false;
       await delay(Math.min(25, Math.max(1, remaining)));
     }
+    return true;
   }
 
   /**

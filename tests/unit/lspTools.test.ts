@@ -81,6 +81,7 @@ describe("LSP tools", () => {
       rootDir: "/repo",
       filePath: "/repo/src/index.ts",
       uri: "file:///repo/src/index.ts",
+      published: true,
       diagnostics: [
         {
           range: { start: { line: 2, character: 4 }, end: { line: 2, character: 8 } },
@@ -219,6 +220,7 @@ describe("LSP tools", () => {
         rootDir: "/repo",
         filePath: "/repo/src/index.ts",
         uri: "file:///repo/src/index.ts",
+        published: true,
         diagnostics: [
           {
             range: { start: { line: 9, character: 0 }, end: { line: 9, character: 1 } },
