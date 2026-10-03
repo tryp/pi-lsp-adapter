@@ -320,16 +320,20 @@ export class LspRuntimeManager {
     if (candidates.length === 0) return undefined;
 
     // Longest matching root wins: the most specific project owns the file.
-    const owner =
-      candidates
-        .filter((entry) => isPathInside(entry.rootDir, resolvedPath))
-        .sort((a, b) => b.rootDir.length - a.rootDir.length)[0] ?? undefined;
-
-    // Fall back to the only candidate when no root contains the file (for
-    // example a file outside every workspace root whose client still has it
-    // open). With several such clients the choice is ambiguous, so report no
-    // baseline rather than guessing and mis-attributing errors.
-    if (!owner && candidates.length > 1) return undefined;
+    // Ties (equal roots) are broken by serverId so the choice is stable
+    // rather than dependent on client insertion order.
+    const owner = candidates
+      .filter((entry) => isPathInside(entry.rootDir, resolvedPath))
+      .sort(
+        (a, b) =>
+          b.rootDir.length - a.rootDir.length ||
+          a.serverId.localeCompare(b.serverId),
+      )[0];
+    if (!owner && candidates.length > 1) {
+      // Several clients could own the file and none contains it. Choosing
+      // arbitrarily would mis-attribute errors, so report no baseline.
+      return undefined;
+    }
     const client = owner ?? candidates[0];
 
     return client.getPublishedDiagnostics(uri);
