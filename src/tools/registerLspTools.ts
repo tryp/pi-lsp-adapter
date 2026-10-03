@@ -37,7 +37,14 @@ import { ImpactParams, resolveSymbols, analyzeImpact, formatAmbiguity } from "./
 //
 // Gated behind --auto-diag (boolean flag, default off).
 
-const pendingBeforeDiags = new Map<string, Diagnostic[]>();
+// Pre-edit diagnostics captured for an in-flight edit/write.
+//
+// An absent baseline is recorded explicitly rather than by omitting the key,
+// because the diff must NOT treat "we failed to snapshot" as "the file was
+// clean" -- doing so reports every pre-existing error as newly introduced.
+type BeforeBaseline = { diagnostics: Diagnostic[] } | { diagnostics: null };
+
+const pendingBeforeDiags = new Map<string, BeforeBaseline>();
 
 function sortDiags(a: Diagnostic, b: Diagnostic): number {
   if (a.range.start.line !== b.range.start.line)
@@ -67,13 +74,9 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     const state = getState();
     if (!state) return;
 
-    // Fire-and-forget — diagnostics reads cached LSP state, near-instant.
-    state.runtimeManager
-      .diagnostics(filePath)
-      .then((r: LspDiagnosticsResult) => {
-        pendingBeforeDiags.set(`${event.toolCallId}:${filePath}`, r.diagnostics);
-      })
-      .catch(() => {});
+    const cacheKey = `${event.toolCallId}:${filePath}`;
+    const cached = state.runtimeManager.cachedDiagnostics(filePath);
+    pendingBeforeDiags.set(cacheKey, { diagnostics: cached ?? null });
   });
 
   // Compare post-mutation diagnostics against cached pre-state; steer on new errors.
@@ -93,6 +96,10 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     const cacheKey = `${event.toolCallId}:${filePath}`;
     const before = pendingBeforeDiags.get(cacheKey);
     pendingBeforeDiags.delete(cacheKey);
+    // No baseline was captured (no live client for this file yet), so we
+    // cannot tell pre-existing errors from newly introduced ones. Stay silent
+    // rather than reporting the file's whole error set as "new".
+    if (!before || before.diagnostics === null) return;
 
     // Run diagnostics + query code actions on post-mutation state.
     let afterResult: {
@@ -108,7 +115,7 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     const rawAfter = afterResult.diagnostics.diagnostics;
 
     // Sort both arrays identically so diagnosticActions indices align.
-    const sortedBefore = (before ?? []).sort(sortDiags);
+    const sortedBefore = [...before.diagnostics].sort(sortDiags);
     const sortedAfter = [...rawAfter].sort(sortDiags);
 
     // Build a Set-key for each before-diagnostic for O(n) lookup.

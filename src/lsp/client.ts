@@ -115,7 +115,7 @@ export class LspClient {
   private readonly pid: number;
   private readonly process: LspServerProcess;
   private readonly connection: LspConnection;
-  private readonly diagnosticsByUri = new Map<string, Diagnostic[]>();
+  private readonly diagnosticsByUri = new Map<string, { diagnostics: Diagnostic[]; version?: number }>();
   private readonly documents = new Map<string, LspClientDocument>();
   private readonly disposables: Disposable[] = [];
   private capabilities: ServerCapabilities | undefined;
@@ -198,7 +198,23 @@ export class LspClient {
   }
 
   getDiagnostics(uri: string): Diagnostic[] {
-    return this.diagnosticsByUri.get(uri) ?? [];
+    return this.diagnosticsByUri.get(uri)?.diagnostics ?? [];
+  }
+
+  getPublishedVersion(uri: string): number | undefined {
+    return this.diagnosticsByUri.get(uri)?.version;
+  }
+
+  getPublishedDiagnostics(uri: string): Diagnostic[] | undefined {
+    return this.diagnosticsByUri.get(uri)?.diagnostics;
+  }
+
+  hasDocument(uri: string): boolean {
+    return this.documents.has(uri);
+  }
+
+  getDocumentVersion(uri: string): number | undefined {
+    return this.documents.get(uri)?.version;
   }
 
   async hover(uri: string, line: number, character: number): Promise<Hover | null> {
@@ -440,7 +456,7 @@ export class LspClient {
     this.disposables.push(
       this.connection.onNotification(PublishDiagnosticsNotification.method, (params) => {
         if (!isPublishDiagnosticsParams(params)) return;
-        this.diagnosticsByUri.set(params.uri, params.diagnostics);
+        this.diagnosticsByUri.set(params.uri, { diagnostics: params.diagnostics, version: params.version });
       }),
     );
 
@@ -535,14 +551,15 @@ function supportedSymbolKinds(): SymbolKind[] {
   return Array.from({ length: 26 }, (_value, index) => index + 1) as SymbolKind[];
 }
 
-function isPublishDiagnosticsParams(value: unknown): value is { uri: string; diagnostics: Diagnostic[] } {
+function isPublishDiagnosticsParams(value: unknown): value is { uri: string; diagnostics: Diagnostic[]; version?: number } {
   return (
     typeof value === "object" &&
     value !== null &&
     "uri" in value &&
     typeof value.uri === "string" &&
     "diagnostics" in value &&
-    Array.isArray(value.diagnostics)
+    Array.isArray(value.diagnostics) &&
+    (!("version" in value) || typeof value.version === "number")
   );
 }
 

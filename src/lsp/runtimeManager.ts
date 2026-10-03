@@ -8,6 +8,7 @@ import type {
   CodeAction,
   Command,
   Definition,
+  Diagnostic,
   DocumentSymbol,
   Hover,
   Location,
@@ -297,9 +298,16 @@ export class LspRuntimeManager {
     }
   }
 
+  cachedDiagnostics(filePath: string): Diagnostic[] | undefined {
+    const resolvedPath = this.resolvePath(filePath);
+    const uri = URI.file(resolvedPath).toString();
+    const client = [...this.clients.values()].find((entry) => !entry.isExited && entry.hasDocument(uri));
+    return client?.getPublishedDiagnostics(uri);
+  }
+
   async diagnostics(filePath: string): Promise<LspDiagnosticsResult> {
     const target = await this.prepareFileTarget(filePath);
-    await delay(this.diagnosticsWaitMs);
+    await this.waitForPublishedDiagnostics(target.client, target.uri);
     return {
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
@@ -307,6 +315,41 @@ export class LspRuntimeManager {
       uri: target.uri,
       diagnostics: target.client.getDiagnostics(target.uri),
     };
+  }
+
+  /**
+   * Wait for diagnostics that correspond to the document version we just
+   * synced.
+   *
+   * A fixed delay is a guess: too short reads the previous version's
+   * diagnostics (already-fixed errors reported as new), too long wastes a
+   * turn. When the server reports versions we can wait for the one we asked
+   * for. Servers may omit `version` on publishDiagnostics, so fall back to
+   * the fixed delay rather than spinning on a value that will never arrive.
+   */
+  private async waitForPublishedDiagnostics(
+    client: LspClient,
+    uri: string,
+  ): Promise<void> {
+    const syncedVersion = client.getDocumentVersion(uri);
+
+    if (syncedVersion === undefined) {
+      await delay(this.diagnosticsWaitMs);
+      return;
+    }
+
+    const deadline = Date.now() + this.diagnosticsWaitMs;
+    for (;;) {
+      const publishedVersion = client.getPublishedVersion(uri);
+      // A version-less publication cannot be matched to our sync; treat any
+      // publication as the best answer available and let the caller read it.
+      if (publishedVersion === undefined && client.getPublishedDiagnostics(uri) !== undefined) {
+        return;
+      }
+      if (publishedVersion !== undefined && publishedVersion >= syncedVersion) return;
+      if (Date.now() >= deadline) return;
+      await delay(Math.min(25, Math.max(1, deadline - Date.now())));
+    }
   }
 
   /**

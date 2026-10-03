@@ -215,6 +215,7 @@ function runtimeManager(
     spawner?: () => LspServerProcess;
     connectionFactory?: (process: LspServerProcess) => LspConnection;
     installManager?: LspInstallManager;
+    diagnosticsWaitMs?: number;
   } = {},
 ): LspRuntimeManager & {
   registry: LspProcessRegistry;
@@ -234,7 +235,7 @@ function runtimeManager(
     lockfileOptions: { lockfilePath: join(tempDir, "lsp.lock.json") },
     spawner: options.spawner ?? (() => new FakeProcess(nextPid++)),
     connectionFactory: options.connectionFactory ?? ((process) => new FakeConnection(process.pid!)),
-    diagnosticsWaitMs: 0,
+    diagnosticsWaitMs: options.diagnosticsWaitMs ?? 0,
     requestTimeoutMs: 500,
     shutdownGraceMs: 0,
   }) as LspRuntimeManager & { registry: LspProcessRegistry };
@@ -318,6 +319,72 @@ class NonExitingFakeProcess extends EventEmitter implements LspServerProcess {
   }
 }
 
+describe("diagnostics publication waiting", () => {
+  it("waits for the synced version when the server reports versions", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const runtime = runtimeManager({
+      diagnosticsWaitMs: 2000,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, {
+          publishDelayMs: 60,
+          publishVersion: 1,
+        }),
+    });
+
+    const result = await runtime.diagnostics("src/index.ts");
+
+    expect(result.diagnostics[0]?.message).toBe("Type mismatch");
+  });
+
+  it("returns promptly for a version-less publication instead of burning the timeout", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    // FakeConnection publishes with no `version`, matching servers that omit
+    // the optional field. A `published < synced` comparison is always false
+    // for undefined, so a naive loop would spin to the deadline.
+    const runtime = runtimeManager({ diagnosticsWaitMs: 3000 });
+
+    const started = Date.now();
+    const result = await runtime.diagnostics("src/index.ts");
+    const elapsed = Date.now() - started;
+
+    expect(result.diagnostics[0]?.message).toBe("Type mismatch");
+    expect(elapsed).toBeLessThan(1500);
+  });
+});
+
+describe("cachedDiagnostics (pre-edit baseline)", () => {
+  it("returns undefined when no client exists for the file", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const x = 1;\n", "utf8");
+
+    const runtime = runtimeManager();
+
+    // No server has been started for this file: there is no baseline, and the
+    // lookup must NOT start one or sync the file.
+    expect(runtime.cachedDiagnostics("src/index.ts")).toBeUndefined();
+  });
+
+  it("returns cached diagnostics without starting another client", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const spawner = vi.fn(() => new FakeProcess(nextPid++));
+    const runtime = runtimeManager({ spawner });
+
+    await runtime.diagnostics("src/index.ts");
+    const spawnsAfterWarmup = spawner.mock.calls.length;
+
+    const baseline = runtime.cachedDiagnostics("src/index.ts");
+
+    expect(baseline?.[0]?.message).toBe("Type mismatch");
+    expect(spawner.mock.calls.length).toBe(spawnsAfterWarmup);
+  });
+});
+
 class FakeConnection implements LspConnection {
   readonly notifications: Array<{ method: string; params: unknown }> = [];
   private readonly notificationHandlers = new Map<string, (params: unknown) => void>();
@@ -331,6 +398,10 @@ class FakeConnection implements LspConnection {
       documentSymbolProvider: true,
       workspaceSymbolProvider: true,
     },
+    private readonly publishOptions: {
+      publishDelayMs?: number;
+      publishVersion?: number;
+    } = {},
   ) {}
 
   listen(): void {}
@@ -348,17 +419,26 @@ class FakeConnection implements LspConnection {
   async sendNotification(method: string, params?: unknown): Promise<void> {
     this.notifications.push({ method, params });
     if (method === DidOpenTextDocumentNotification.method && isDidOpenParams(params)) {
-      this.notificationHandlers.get(PublishDiagnosticsNotification.method)?.({
-        uri: params.textDocument.uri,
-        diagnostics: [
-          {
-            range: { start: { line: 0, character: 6 }, end: { line: 0, character: 11 } },
-            severity: 1,
-            message: "Type mismatch",
-            source: `fake-${this.pid}`,
-          },
-        ],
-      });
+      const publish = () =>
+        this.notificationHandlers.get(PublishDiagnosticsNotification.method)?.({
+          uri: params.textDocument.uri,
+          diagnostics: [
+            {
+              range: { start: { line: 0, character: 6 }, end: { line: 0, character: 11 } },
+              severity: 1,
+              message: "Type mismatch",
+              source: `fake-${this.pid}`,
+            },
+          ],
+          // Servers may omit `version`; only include it when configured.
+          ...(this.publishOptions.publishVersion === undefined
+            ? {}
+            : { version: this.publishOptions.publishVersion }),
+        });
+
+      const delayMs = this.publishOptions.publishDelayMs ?? 0;
+      if (delayMs > 0) setTimeout(publish, delayMs);
+      else publish();
     }
   }
 

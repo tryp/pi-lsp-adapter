@@ -515,3 +515,104 @@ describe("LspClient", () => {
     expect(unregisterSpy).toHaveBeenCalledWith("test-ls:/repo", 9999);
   });
 });
+
+describe("published diagnostics version tracking", () => {
+  async function startedClient() {
+    const process = new FakeProcess(9999);
+    const connection = new FakeConnection();
+    const registry = new LspProcessRegistry({
+      path: registryPath,
+      ownerId: "test",
+      probe: fakeProbe(),
+    });
+    const client = new LspClient({
+      id: "test-ls:/repo",
+      ownerId: "test",
+      config: config(tempDir),
+      processRegistry: registry,
+      spawner: () => process,
+      connectionFactory: () => connection,
+    });
+    await client.start();
+    return { client, connection };
+  }
+
+  const uri = "file:///repo/index.ts";
+
+  function publish(connection: FakeConnection, diagnostics: unknown[], version?: number) {
+    connection.emitNotification(PublishDiagnosticsNotification.method, {
+      uri,
+      diagnostics,
+      ...(version === undefined ? {} : { version }),
+    });
+  }
+
+  it("records the version supplied with a publication", async () => {
+    const { client, connection } = await startedClient();
+    await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 1;\n");
+
+    publish(connection, [], 7);
+
+    expect(client.getPublishedVersion(uri)).toBe(7);
+  });
+
+  it("reports no version when the server omits it", async () => {
+    const { client, connection } = await startedClient();
+    await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 1;\n");
+
+    publish(connection, []);
+
+    expect(client.getPublishedVersion(uri)).toBeUndefined();
+  });
+
+  it("distinguishes an unpublished uri from a published empty result", async () => {
+    const { client, connection } = await startedClient();
+    await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 1;\n");
+
+    // Nothing published yet: the caller must be able to tell this apart from
+    // "published and clean", or it cannot know whether a baseline exists.
+    expect(client.getPublishedDiagnostics(uri)).toBeUndefined();
+
+    publish(connection, [], 1);
+
+    expect(client.getPublishedDiagnostics(uri)).toEqual([]);
+  });
+
+  it("tracks the synced document version separately from the published one", async () => {
+    const { client } = await startedClient();
+    const synced = await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 1;\n");
+    expect(client.getDocumentVersion(synced)).toBe(1);
+
+    await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 2;\n");
+    expect(client.getDocumentVersion(synced)).toBe(2);
+
+    // Re-syncing identical text must not bump the version.
+    await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 2;\n");
+    expect(client.getDocumentVersion(synced)).toBe(2);
+  });
+
+  it("ignores a publication whose version is not a number", async () => {
+    const { client, connection } = await startedClient();
+    await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 1;\n");
+
+    publish(connection, [], "seven" as never);
+
+    expect(client.getPublishedVersion(uri)).toBeUndefined();
+  });
+
+  it("keeps getDiagnostics working for existing callers", async () => {
+    const { client, connection } = await startedClient();
+    await client.syncFile(join(tempDir, "index.ts"), "typescript", "const x = 1;\n");
+
+    publish(connection, [
+      {
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+        severity: 1,
+        message: "error",
+      },
+    ], 3);
+
+    expect(client.getDiagnostics(uri)).toHaveLength(1);
+    expect(client.getDiagnostics("file:///repo/other.ts")).toEqual([]);
+  });
+});
