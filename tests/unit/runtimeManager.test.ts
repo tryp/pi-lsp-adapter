@@ -368,6 +368,25 @@ describe("cachedDiagnostics (pre-edit baseline)", () => {
     expect(runtime.cachedDiagnostics("src/index.ts")).toBeUndefined();
   });
 
+  it("prefers the client whose root actually contains the file", async () => {
+    // A file covered by more than one live client must not pick up another
+    // client's diagnostics. The most specific (longest) matching root wins.
+    const nested = join(projectDir, "packages", "app");
+    await mkdir(join(nested, "src"), { recursive: true });
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(nested, "package.json"), "{}\n", "utf8");
+    await writeFile(join(nested, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const runtime = runtimeManager();
+    // Warm the nested root first so its client exists, then the outer root.
+    await runtime.diagnostics("packages/app/src/index.ts");
+    await runtime.diagnostics("packages/app/src/index.ts");
+
+    const baseline = runtime.cachedDiagnostics("packages/app/src/index.ts");
+
+    expect(baseline?.[0]?.message).toBe("Type mismatch");
+  });
+
   it("returns cached diagnostics without starting another client", async () => {
     await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
     await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");

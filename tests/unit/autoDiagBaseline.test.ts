@@ -189,15 +189,63 @@ describe("auto-diag baseline handling", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  it("takes the baseline synchronously from the cache, never awaiting a read", () => {
-    // The pre-edit snapshot must not be a fire-and-forget async read: that was
-    // what let it capture post-edit state.
-    const cachedDiagnostics = vi.fn(() => [diag(1, "snapshot")]);
-    const state = fakeState({ cachedDiagnostics });
-    const { handlers } = setup(state);
+  it("uses the baseline captured at tool_call, not a later cache state", async () => {
+    // The pre-edit baseline must be snapshotted synchronously at tool_call.
+    // If the handler deferred the read, it could observe post-edit state.
+    let cache: ReturnType<typeof diag>[] = [diag(1, "pre-edit state")];
+    const state = fakeState({
+      cachedDiagnostics: () => cache,
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(1, "pre-edit state"), diag(9, "introduced")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
 
     handlers.get("tool_call")!(editCall("c6", "/repo/f.py"));
 
-    expect(cachedDiagnostics).toHaveBeenCalledTimes(1);
+    // The cache changes after the baseline was taken (as it would once the
+    // edit lands and the server republishes).
+    cache = [diag(1, "pre-edit state"), diag(9, "introduced")];
+
+    await handlers.get("tool_result")!(editResult("c6", "/repo/f.py"));
+
+    // Only "introduced" is new relative to the captured baseline.
+    const body = autoDiagBody(sendMessage);
+    expect(body).toContain("1 new error");
+    expect(body).toContain("introduced");
+    expect(body).not.toContain("pre-edit state");
+  });
+
+  it("does not retain a failed edit's baseline for a later result", async () => {
+    // Failed edits are common. If their entry survives, a later result for the
+    // same tool call would diff against an outdated snapshot and mis-report.
+    // Here the kept baseline says "clean", while the file actually has a
+    // pre-existing error that must NOT be blamed on this edit.
+    const state = fakeState({
+      cachedDiagnostics: () => [],
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(4, "pre-existing, not from this edit")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+
+    handlers.get("tool_call")!(editCall("c7", "/repo/g.py"));
+
+    await handlers.get("tool_result")!({
+      toolName: "edit", toolCallId: "c7", input: { path: "/repo/g.py" }, isError: true,
+    } as never);
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // The baseline must be gone, so this result has no baseline and stays
+    // silent instead of reporting the pre-existing error as new.
+    await handlers.get("tool_result")!({
+      toolName: "edit", toolCallId: "c7", input: { path: "/repo/g.py" }, isError: false,
+    } as never);
+
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });

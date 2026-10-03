@@ -298,11 +298,41 @@ export class LspRuntimeManager {
     }
   }
 
+  /**
+   * Read diagnostics for a file from an ALREADY-ACTIVE client, without
+   * starting a server, reading the file, or syncing anything.
+   *
+   * Used for the auto-diag pre-edit baseline: the baseline must reflect the
+   * document state that was live before the edit, so it must not race the
+   * edit by re-reading the file or mutating the client's document.
+   *
+   * Returns undefined when there is no usable baseline. Prefers the client
+   * whose root actually contains the file, so a file covered by more than one
+   * client (nested roots, multiple servers for one filetype) does not get
+   * another client's diagnostics.
+   */
   cachedDiagnostics(filePath: string): Diagnostic[] | undefined {
     const resolvedPath = this.resolvePath(filePath);
     const uri = URI.file(resolvedPath).toString();
-    const client = [...this.clients.values()].find((entry) => !entry.isExited && entry.hasDocument(uri));
-    return client?.getPublishedDiagnostics(uri);
+    const candidates = [...this.clients.values()].filter(
+      (entry) => !entry.isExited && entry.hasDocument(uri),
+    );
+    if (candidates.length === 0) return undefined;
+
+    // Longest matching root wins: the most specific project owns the file.
+    const owner =
+      candidates
+        .filter((entry) => isPathInside(entry.rootDir, resolvedPath))
+        .sort((a, b) => b.rootDir.length - a.rootDir.length)[0] ?? undefined;
+
+    // Fall back to the only candidate when no root contains the file (for
+    // example a file outside every workspace root whose client still has it
+    // open). With several such clients the choice is ambiguous, so report no
+    // baseline rather than guessing and mis-attributing errors.
+    if (!owner && candidates.length > 1) return undefined;
+    const client = owner ?? candidates[0];
+
+    return client.getPublishedDiagnostics(uri);
   }
 
   async diagnostics(filePath: string): Promise<LspDiagnosticsResult> {
@@ -338,7 +368,7 @@ export class LspRuntimeManager {
       return;
     }
 
-    const deadline = Date.now() + this.diagnosticsWaitMs;
+    const deadline = performance.now() + this.diagnosticsWaitMs;
     for (;;) {
       const publishedVersion = client.getPublishedVersion(uri);
       // A version-less publication cannot be matched to our sync; treat any
@@ -347,8 +377,9 @@ export class LspRuntimeManager {
         return;
       }
       if (publishedVersion !== undefined && publishedVersion >= syncedVersion) return;
-      if (Date.now() >= deadline) return;
-      await delay(Math.min(25, Math.max(1, deadline - Date.now())));
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return;
+      await delay(Math.min(25, Math.max(1, remaining)));
     }
   }
 

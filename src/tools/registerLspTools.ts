@@ -81,10 +81,19 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
 
   // Compare post-mutation diagnostics against cached pre-state; steer on new errors.
   pi.on("tool_result", async (event, _ctx) => {
+    // Clear the pending baseline on EVERY result path. Failed or blocked edits
+    // are common, and leaving their entry behind would grow this module-global
+    // map for the lifetime of the session.
+    const resultPath = (event.input as { path?: string }).path;
+    const resultKey =
+      resultPath && event.toolCallId ? `${event.toolCallId}:${resultPath}` : undefined;
+    const before = resultKey ? pendingBeforeDiags.get(resultKey) : undefined;
+    if (resultKey) pendingBeforeDiags.delete(resultKey);
+
     if (event.isError) return;
     if (event.toolName !== "edit" && event.toolName !== "write") return;
 
-    const filePath = (event.input as { path?: string }).path;
+    const filePath = resultPath;
     if (!filePath) return;
 
     const enabled = pi.getFlag("auto-diag");
@@ -93,9 +102,6 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     const state = getState();
     if (!state) return;
 
-    const cacheKey = `${event.toolCallId}:${filePath}`;
-    const before = pendingBeforeDiags.get(cacheKey);
-    pendingBeforeDiags.delete(cacheKey);
     // No baseline was captured (no live client for this file yet), so we
     // cannot tell pre-existing errors from newly introduced ones. Stay silent
     // rather than reporting the file's whole error set as "new".
