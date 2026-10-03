@@ -58,6 +58,39 @@ describe("registerLspWarmup", () => {
     expect(warmupFile).not.toHaveBeenCalled();
   });
 
+  it("warms on edit so the next edit to that file has an auto-diag baseline", () => {
+    // A file no client has opened has no pre-edit baseline, so auto-diag
+    // cannot report on that edit. Opening the document here means later edits
+    // to the same file are covered.
+    const warmupFile = vi.fn().mockResolvedValue(true);
+    const state = fakeState({ warmupFile });
+    const handler = registerAndGetHandler(() => state);
+
+    handler({ toolName: "edit", input: { path: "src/index.ts" } }, fakeContext());
+
+    expect(warmupFile).toHaveBeenCalledWith("src/index.ts");
+  });
+
+  it("warms on write too", () => {
+    const warmupFile = vi.fn().mockResolvedValue(true);
+    const state = fakeState({ warmupFile });
+    const handler = registerAndGetHandler(() => state);
+
+    handler({ toolName: "write", input: { path: "src/new.ts" } }, fakeContext());
+
+    expect(warmupFile).toHaveBeenCalledWith("src/new.ts");
+  });
+
+  it("does not warm an edit when warmup is disabled", () => {
+    const warmupFile = vi.fn().mockResolvedValue(true);
+    const state = fakeState({ warmup: false, warmupFile });
+    const handler = registerAndGetHandler(() => state);
+
+    handler({ toolName: "edit", input: { path: "src/index.ts" } }, fakeContext());
+
+    expect(warmupFile).not.toHaveBeenCalled();
+  });
+
   it("swallows background warmup failures", async () => {
     const warmupFile = vi.fn().mockRejectedValue(new Error("boom"));
     const state = fakeState({ warmupFile });
