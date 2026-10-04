@@ -172,6 +172,33 @@ describe("loadLspConfig", () => {
     });
   });
 
+  it("accepts a per-server diagnosticsWaitMs from a trusted project", async () => {
+    // The post-edit wait bound has to be per server: pyright on a large
+    // Python project needs seconds where a warm vtsls needs milliseconds.
+    await writeJson(getUserConfigPath(), {
+      servers: { pyright: { diagnosticsWaitMs: 9000 } },
+    });
+    await writeJson(getProjectConfigPath(projectRoot), {
+      servers: { pyright: { diagnosticsWaitMs: 12000 } },
+    });
+
+    const result = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(result.warnings).toEqual([]);
+    expect(result.catalog.servers.pyright.diagnosticsWaitMs).toBe(12000);
+  });
+
+  it("rejects a diagnosticsWaitMs that is not a sane duration", async () => {
+    await writeJson(getUserConfigPath(), {
+      servers: { pyright: { diagnosticsWaitMs: -1 } },
+    });
+
+    const result = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(result.warnings.join("\n")).toContain("diagnosticsWaitMs");
+    expect(result.catalog.servers.pyright.diagnosticsWaitMs).toBeUndefined();
+  });
+
   it("restricts untrusted project config to safe server fields and ignores project installMode", async () => {
     await writeJson(getProjectConfigPath(projectRoot), {
       installMode: "auto",

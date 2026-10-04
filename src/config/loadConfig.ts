@@ -43,6 +43,9 @@ const SAFE_PROJECT_SERVER_FIELDS = new Set([
   "initializationOptions",
   "env",
   "cwd",
+  // A wait bound is a latency budget, not a privilege: a trusted project may
+  // raise it for a slow server. It cannot execute anything.
+  "diagnosticsWaitMs",
 ]);
 
 const DANGEROUS_PROJECT_ENV_KEYS = new Set([

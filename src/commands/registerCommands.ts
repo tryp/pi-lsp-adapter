@@ -3,6 +3,7 @@ import { readLockfile } from "../install/lockfile.js";
 import { parseServerVersionSpec } from "../install/version.js";
 import type { LspExtensionState } from "../state.js";
 import { setLspStatusLine } from "../statusLine.js";
+import { getAutoDiagStats } from "../tools/registerLspTools.js";
 import { LspPanel, type LspPanelAction } from "../ui/lspPanel.js";
 import { formatLspDoctor, formatLspStatus, type LspStatusSnapshot } from "./status.js";
 
@@ -205,10 +206,12 @@ async function terminateMatchingProcesses(state: LspExtensionState, serverId?: s
 }
 
 async function buildSnapshot(state: LspExtensionState): Promise<LspStatusSnapshot> {
+  const stats = getAutoDiagStats();
   return {
     config: state.config,
     lockfile: await readLockfile(),
     processes: await state.processRegistry.list(),
+    autoDiagStats: stats.edits > 0 ? stats : undefined,
   };
 }
 

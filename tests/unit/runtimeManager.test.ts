@@ -11,7 +11,7 @@ import {
   PublishDiagnosticsNotification,
 } from "vscode-languageserver-protocol";
 import type { Disposable } from "vscode-jsonrpc";
-import { LspRuntimeManager } from "../../src/lsp/runtimeManager.js";
+import { LspRuntimeManager, MAX_DIAGNOSTICS_WAIT_MS } from "../../src/lsp/runtimeManager.js";
 import type { LspConnection, LspServerProcess } from "../../src/lsp/client.js";
 import { LspProcessRegistry, type ProcessProbe } from "../../src/lsp/processRegistry.js";
 import type { LspInstallManager } from "../../src/install/manager.js";
@@ -217,6 +217,10 @@ function runtimeManager(
     connectionFactory?: (process: LspServerProcess) => LspConnection;
     installManager?: LspInstallManager;
     diagnosticsWaitMs?: number;
+    /** Leave the option unset so the built-in default applies. */
+    omitDiagnosticsWaitMs?: boolean;
+    /** Per-server override under test. */
+    serverDiagnosticsWaitMs?: number;
   } = {},
 ): LspRuntimeManager & {
   registry: LspProcessRegistry;
@@ -230,13 +234,15 @@ function runtimeManager(
   const runtime = new LspRuntimeManager({
     cwd: projectDir,
     ownerId: "owner-test",
-    config: config(options.installMode ?? "auto"),
+    config: config(options.installMode ?? "auto", options.serverDiagnosticsWaitMs),
     installManager: options.installManager ?? fakeInstallManager(options.installed ?? true),
     processRegistry: registry,
     lockfileOptions: { lockfilePath: join(tempDir, "lsp.lock.json") },
     spawner: options.spawner ?? (() => new FakeProcess(nextPid++)),
     connectionFactory: options.connectionFactory ?? ((process) => new FakeConnection(process.pid!)),
-    diagnosticsWaitMs: options.diagnosticsWaitMs ?? 0,
+    ...(options.omitDiagnosticsWaitMs
+      ? {}
+      : { diagnosticsWaitMs: options.diagnosticsWaitMs ?? 0 }),
     requestTimeoutMs: 500,
     shutdownGraceMs: 0,
   }) as LspRuntimeManager & { registry: LspProcessRegistry };
@@ -244,9 +250,14 @@ function runtimeManager(
   return runtime;
 }
 
-function config(installMode: LoadLspConfigResult["installMode"]): LoadLspConfigResult {
+function config(
+  installMode: LoadLspConfigResult["installMode"],
+  diagnosticsWaitMs?: number,
+): LoadLspConfigResult {
   return {
-    catalog: { servers: { vtsls: serverDefinition() } },
+    catalog: {
+      servers: { vtsls: { ...serverDefinition(), diagnosticsWaitMs } },
+    },
     warnings: [],
     installMode,
     warmup: true,
@@ -354,6 +365,141 @@ describe("diagnostics publication waiting", () => {
 
     expect(result.diagnostics[0]?.message).toBe("Type mismatch");
     expect(elapsed).toBeLessThan(1500);
+  });
+});
+
+describe("diagnostics wait bound", () => {
+  it("defaults past the old 350ms bound so a slow server is not timed out", async () => {
+    // Measured with scripts/lsp_publish_latency.py: pyright on a large Python
+    // project publishes 1.5-2.3s after a didChange. Under the old 350ms
+    // default every one of those reads timed out and the edit got no steer,
+    // which is why coverage collapsed after the 2026-10-03 deploy.
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const runtime = runtimeManager({
+      omitDiagnosticsWaitMs: true,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, {
+          publishDelayMs: 400,
+          publishVersion: 1,
+        }),
+    });
+
+    const result = await runtime.diagnostics("src/index.ts");
+
+    expect(result.published).toBe(true);
+    expect(result.diagnostics[0]?.message).toBe("Type mismatch");
+  });
+
+  it("uses the server's own diagnosticsWaitMs over the manager default", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    // Manager bound is 0ms, so only the per-server value can let a delayed
+    // publication through.
+    const runtime = runtimeManager({
+      diagnosticsWaitMs: 0,
+      serverDiagnosticsWaitMs: 1500,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, {
+          publishDelayMs: 300,
+          publishVersion: 1,
+        }),
+    });
+
+    const result = await runtime.diagnostics("src/index.ts");
+
+    expect(result.published).toBe(true);
+    expect(result.diagnostics[0]?.message).toBe("Type mismatch");
+  });
+
+  it("reports published=false when the bound expires before the server answers", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const runtime = runtimeManager({
+      serverDiagnosticsWaitMs: 100,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, {
+          publishDelayMs: 800,
+          publishVersion: 1,
+        }),
+    });
+
+    const result = await runtime.diagnostics("src/index.ts");
+
+    // The caller must be able to tell "the server has not answered" from
+    // "the file is clean"; that distinction is what the skip counters count.
+    expect(result.published).toBe(false);
+  });
+
+  it("rejects a publication whose version predates the synced version", async () => {
+    // The publication counter alone would accept this one: it arrived after
+    // the sample. But it answers an older document version -- the still-in-
+    // flight reply to the *previous* edit, which is exactly the stale read
+    // that produced false-positive "new error" complaints before 2026-10-03.
+    // Waiting for a real answer is what the raised bound buys, so the version
+    // signal has to win over the counter.
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const runtime = runtimeManager({
+      serverDiagnosticsWaitMs: 300,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, {
+          publishDelayMs: 50,
+          publishVersion: 0,
+        }),
+    });
+
+    const result = await runtime.diagnostics("src/index.ts");
+
+    expect(result.published).toBe(false);
+  });
+
+  it("clamps a configured wait to the hard ceiling", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    // Per-server config can come from an untrusted project checkout, and this
+    // wait sits on the agent's critical path: a hostile 10-minute bound must
+    // not become a 10-minute edit.
+    const runtime = runtimeManager({
+      serverDiagnosticsWaitMs: 600_000,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, { publishDelayMs: 5, publishVersion: 1 }),
+    });
+
+    const resolved = (
+      runtime as unknown as { diagnosticsWaitMsFor(serverId: string): number }
+    ).diagnosticsWaitMsFor("vtsls");
+
+    expect(resolved).toBe(MAX_DIAGNOSTICS_WAIT_MS);
+  });
+
+  it("waits for a version-less publication that arrives after the sync", async () => {
+    // A server that omits `version` used to sleep for the whole bound and
+    // then accept whatever was cached. Polling the publication counter is
+    // both faster and stricter: it only accepts a publication newer than the
+    // one sampled before the sync.
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "const value: string = 1;\n", "utf8");
+
+    const runtime = runtimeManager({
+      serverDiagnosticsWaitMs: 2000,
+      connectionFactory: (process) =>
+        new FakeConnection(process.pid!, undefined, { publishDelayMs: 120 }),
+    });
+
+    const started = Date.now();
+    const result = await runtime.diagnostics("src/index.ts");
+    const elapsed = Date.now() - started;
+
+    expect(result.published).toBe(true);
+    expect(result.diagnostics[0]?.message).toBe("Type mismatch");
+    // Arrived by polling, not by exhausting a 2000ms bound.
+    expect(elapsed).toBeLessThan(1000);
   });
 });
 

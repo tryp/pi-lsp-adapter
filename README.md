@@ -258,10 +258,36 @@ A server definition can include:
 | `settings`              | LSP settings returned through `workspace/configuration`     |
 | `initializationOptions` | LSP initialization options                                  |
 | `lazy`                  | Whether the server should avoid session-start eager startup |
+| `diagnosticsWaitMs`     | How long to wait for post-edit diagnostics for this server  |
 
 `command` supports placeholders such as `{installBin}`, `{installDir}`, `{platform}`, and `{workspaceDir}`. Relative path-like values are resolved from the detected project root, and `~` is expanded.
 
 Project config is intentionally conservative. In untrusted projects, executable and install overrides are ignored; put those in global config.
+
+### `diagnosticsWaitMs`
+
+After an edit, the adapter asks the server for diagnostics and waits for a publication that corresponds to the document version it just sent. Servers differ by an order of magnitude here: a warm `vtsls` publishes in well under a second, while `pyright` on a large Python project has been measured at 1.5-2.3s per edit. A wait that suits the fast server silently produces no feedback at all on the slow one.
+
+The default is 5000ms. It costs nothing when the server answers quickly, because the wait ends as soon as the matching publication arrives; it only bounds the case where the server never publishes.
+
+Override it per server, and size it at roughly **twice that server's p95 publish latency**:
+
+```json
+{
+  "servers": {
+    "pyright": { "diagnosticsWaitMs": 8000 }
+  }
+}
+```
+
+Measure your own server before choosing a value rather than copying one:
+
+```bash
+# from pi-session-analysis
+make measure-lsp-latency ARGS="--file /path/to/a/representative/file.py"
+```
+
+`/lsp status` reports the bound in effect per server along with the auto-diag outcome counters for the session, including how often the wait expired before the server answered.
 
 ## Using existing LSP binaries
 

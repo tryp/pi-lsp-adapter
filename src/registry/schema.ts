@@ -68,6 +68,17 @@ export interface ServerDefinition<TServerId extends string = string> {
   settings: JsonObject;
   initializationOptions: JsonObject;
   lazy: boolean;
+  /**
+   * How long to wait for post-edit diagnostics matching the document version
+   * just synced, in milliseconds.
+   *
+   * Servers differ by an order of magnitude here: a warm vtsls publishes in
+   * well under a second, while pyright on a large Python project measured
+   * 1.5-2.3s per edit. A bound tuned for the fast case silently drops every
+   * steer on the slow one, so the value is per server. Size it at roughly
+   * twice that server's own p95 publish latency.
+   */
+  diagnosticsWaitMs?: number;
 }
 
 export interface Catalog<TServerId extends string = string> {
@@ -168,6 +179,7 @@ export const ServerDefinitionSchema = Type.Object({
   settings: JsonObjectSchema,
   initializationOptions: JsonObjectSchema,
   lazy: Type.Boolean(),
+  diagnosticsWaitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
 });
 
 export function parseServerDefinition(value: unknown): ParseResult<ServerDefinition> {

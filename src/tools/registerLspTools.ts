@@ -46,6 +46,80 @@ type BeforeBaseline = { diagnostics: Diagnostic[] } | { diagnostics: null };
 
 const pendingBeforeDiags = new Map<string, BeforeBaseline>();
 
+/**
+ * Why an edit did or did not produce a steer.
+ *
+ * Each of these used to be a bare `return`, so a coverage collapse was
+ * indistinguishable from "the edit introduced no errors". Counting them is the
+ * difference between a measurable feature and a silent one.
+ */
+type AutoDiagOutcome =
+  | "emitted"
+  | "no_baseline"
+  | "no_client"
+  | "not_published"
+  | "no_new_errors"
+  | "edit_failed";
+
+const autoDiagStats = {
+  edits: 0,
+  emitted: 0,
+  no_baseline: 0,
+  no_client: 0,
+  not_published: 0,
+  no_new_errors: 0,
+  edit_failed: 0,
+  /** Edits handled since the last persisted snapshot. */
+  unflushed: 0,
+} satisfies Record<AutoDiagOutcome | "edits" | "unflushed", number>;
+
+/** Persist every N edits, so a killed session still leaves usable evidence. */
+const AUTO_DIAG_STATS_FLUSH_EVERY = 20;
+
+/** Current counters, for `/lsp status` and tests. */
+export function getAutoDiagStats() {
+  return { ...autoDiagStats };
+}
+
+/**
+ * Zero the counters at session start.
+ *
+ * Counters live for the process, so without this a `/new` or `/resume` would
+ * report the previous session's edits under the new session's totals.
+ */
+function resetAutoDiagStats(): void {
+  for (const key of Object.keys(autoDiagStats) as Array<keyof typeof autoDiagStats>) {
+    autoDiagStats[key] = 0;
+  }
+}
+
+/**
+ * Persist cumulative auto-diag outcomes to the session file.
+ *
+ * Uses appendEntry, so the counters reach the session log without entering the
+ * model's context. Flushed on a cadence as well as at shutdown: a session that
+ * is killed rather than quit still leaves usable evidence.
+ */
+function recordAutoDiagOutcome(
+  pi: ExtensionAPI,
+  outcome: AutoDiagOutcome,
+): void {
+  autoDiagStats[outcome] += 1;
+  autoDiagStats.edits += 1;
+  autoDiagStats.unflushed += 1;
+  if (autoDiagStats.unflushed >= AUTO_DIAG_STATS_FLUSH_EVERY) {
+    flushAutoDiagStats(pi);
+  }
+}
+
+function flushAutoDiagStats(pi: ExtensionAPI): void {
+  if (autoDiagStats.unflushed === 0) return;
+  // Zero after the write, not before: appendEntry is the one call here that
+  // can throw, and zeroing first would lose the batch it failed to record.
+  pi.appendEntry("auto_diag_stats", { ...autoDiagStats });
+  autoDiagStats.unflushed = 0;
+}
+
 function sortDiags(a: Diagnostic, b: Diagnostic): number {
   if (a.range.start.line !== b.range.start.line)
     return a.range.start.line - b.range.start.line;
@@ -110,14 +184,18 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     const before = resultKey ? pendingBeforeDiags.get(resultKey) : undefined;
     if (resultKey) pendingBeforeDiags.delete(resultKey);
 
-    if (event.isError) return;
     if (event.toolName !== "edit" && event.toolName !== "write") return;
-
-    const filePath = resultPath;
-    if (!filePath) return;
 
     const enabled = pi.getFlag("auto-diag");
     if (!enabled) return;
+
+    if (event.isError) {
+      recordAutoDiagOutcome(pi, "edit_failed");
+      return;
+    }
+
+    const filePath = resultPath;
+    if (!filePath) return;
 
     const state = getState();
     if (!state) return;
@@ -125,9 +203,15 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     // No baseline was captured (no live client for this file yet), so we
     // cannot tell pre-existing errors from newly introduced ones. Stay silent
     // rather than reporting the file's whole error set as "new".
-    if (!before || before.diagnostics === null) return;
+    if (!before || before.diagnostics === null) {
+      recordAutoDiagOutcome(pi, "no_baseline");
+      return;
+    }
 
-    // Run diagnostics + query code actions on post-mutation state.
+    // Run diagnostics + query code actions on post-mutation state. This throws
+    // only when the file has no live LSP client at all; a failed code-action
+    // lookup degrades to "no fix annotations" inside diagnosticsWithFixes, so
+    // it cannot be miscounted as missing coverage.
     let afterResult: {
       diagnostics: LspDiagnosticsResult;
       diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }>;
@@ -135,7 +219,17 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     try {
       afterResult = await state.runtimeManager.diagnosticsWithFixes(filePath);
     } catch {
-      return; // LSP doesn't cover this file type — nothing to report.
+      // LSP doesn't cover this file type — nothing to report.
+      recordAutoDiagOutcome(pi, "no_client");
+      return;
+    }
+
+    // The post-edit read waits for a publication matching the version it
+    // synced, bounded per server. Timing out here means the diff would be
+    // taken against a cache the server has not refreshed for this edit.
+    if (afterResult.diagnostics.published === false) {
+      recordAutoDiagOutcome(pi, "not_published");
+      return;
     }
 
     const rawAfter = afterResult.diagnostics.diagnostics;
@@ -170,7 +264,10 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       newErrors.push({ d, sortedIndex: i });
     }
 
-    if (newErrors.length === 0) return;
+    if (newErrors.length === 0) {
+      recordAutoDiagOutcome(pi, "no_new_errors");
+      return;
+    }
 
     // Build steer message.
     const lines: string[] = [];
@@ -214,6 +311,20 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       },
       { deliverAs: "steer" },
     );
+
+    recordAutoDiagOutcome(pi, "emitted");
+  });
+
+  // Persist the counters when the session ends so the outcome mix is recorded
+  // even for short sessions that never reach the periodic flush.
+  pi.on("session_shutdown", () => {
+    flushAutoDiagStats(pi);
+  });
+
+  // Counters live for the process, so a `/new` or `/resume` would otherwise
+  // report the previous session's edits under the new session's totals.
+  pi.on("session_start", () => {
+    resetAutoDiagStats();
   });
 }
 

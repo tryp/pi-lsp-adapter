@@ -46,10 +46,43 @@ export interface LspRuntimeManagerOptions {
   connectionFactory?: LspConnectionFactory;
   lockfileOptions?: LockfileOptions;
   requestTimeoutMs?: number;
+  /**
+   * Fallback post-edit diagnostics wait bound, used when a server sets no
+   * `diagnosticsWaitMs` of its own.
+   */
   diagnosticsWaitMs?: number;
   shutdownGraceMs?: number;
   extraWorkspaceRoots?: string[];
 }
+
+/**
+ * Default post-edit diagnostics wait bound, in milliseconds.
+ *
+ * Measured with `scripts/lsp_publish_latency.py` against real servers: vtsls
+ * and pyright on a small project publish within ~260ms, while pyright on a
+ * large Python project takes 1.5-2.3s per edit. The old 350ms default matched
+ * the fast case only, and session analysis of the 2026-10-03 deploy showed the
+ * result: steer coverage on covered edits fell from 40% to 8%, because every
+ * slow-server publication missed the bound and the read silently returned
+ * without a steer.
+ *
+ * 5s is roughly twice the p95 measured on the slow case. It costs nothing when
+ * the server answers quickly because the wait ends as soon as the matching
+ * publication arrives; it only bounds the pathological case where the server
+ * never publishes at all.
+ */
+export const DEFAULT_DIAGNOSTICS_WAIT_MS = 5_000;
+
+/**
+ * Hard ceiling for any configured diagnostics wait.
+ *
+ * An edit's tool_result handler awaits this wait, so the bound is on the
+ * agent's critical path, and per-server config can come from a project
+ * checkout the user has not trusted. Long enough for a very slow server on a
+ * very large project (the measured worst case was ~2.3s), short enough that a
+ * hostile value cannot hold a turn open for ten minutes.
+ */
+export const MAX_DIAGNOSTICS_WAIT_MS = 30_000;
 
 export type LspStartStatus =
   | "started"
@@ -169,7 +202,7 @@ export class LspRuntimeManager {
     this.connectionFactory = options.connectionFactory;
     this.lockfileOptions = options.lockfileOptions ?? {};
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
-    this.diagnosticsWaitMs = options.diagnosticsWaitMs ?? 350;
+    this.diagnosticsWaitMs = options.diagnosticsWaitMs ?? DEFAULT_DIAGNOSTICS_WAIT_MS;
     this.shutdownGraceMs = options.shutdownGraceMs ?? 1_000;
   }
 
@@ -358,7 +391,7 @@ export class LspRuntimeManager {
 
   /**
    * Wait for diagnostics that correspond to the document version we just
-   * synced.
+   * synced, bounded by the server's configured wait.
    *
    * A fixed delay is a guess: too short reads the previous version's
    * diagnostics (already-fixed errors reported as new), too long wastes a
@@ -366,16 +399,22 @@ export class LspRuntimeManager {
    *
    *  1. The document version the server echoes on `publishDiagnostics`, when
    *     it sends one. Anything below the version we synced is the previous
-   *     edit's answer.
+   *     edit's answer -- including a publication that was merely still in
+   *     flight when we sampled, which on a slow server can arrive seconds
+   *     after the edit that caused it.
    *  2. The client's own publication counter, sampled before the sync. Servers
    *     may omit `version` entirely (it is optional in the protocol), so this
    *     is what distinguishes "published in response to my sync" from
    *     "published some time ago". Without it, a version-less server would
    *     return a stale publication immediately.
    *
-   * If neither signal can advance (no client version, no publication at all),
-   * fall back to the fixed delay rather than spinning on a value that will
-   * never arrive.
+   * Signal 1 wins whenever the server echoes a version, and signal 2 is only a
+   * fallback for servers that never do: the counter alone cannot tell a fresh
+   * publication from a late answer to the previous edit.
+   *
+   * Polls rather than sleeping for the whole bound, so the common case costs
+   * one publication latency rather than the entire wait. Expiry returns false
+   * so the caller never mistakes an unrefreshed cache for a clean file.
    */
   private async waitForPublishedDiagnostics(
     client: LspClient,
@@ -383,18 +422,24 @@ export class LspRuntimeManager {
     seqBeforeSync: number,
   ): Promise<boolean> {
     const syncedVersion = client.getDocumentVersion(uri);
-    const deadline = performance.now() + this.diagnosticsWaitMs;
+    const deadline = performance.now() + this.diagnosticsWaitMsFor(client.serverId);
 
-    if (syncedVersion === undefined) {
-      await delay(this.diagnosticsWaitMs);
-      return client.getPublishedSeq(uri) !== undefined;
-    }
-
+    // Order matters: the version signal is checked first and the counter is
+    // only a fallback for servers that omit `version`. Checking the counter
+    // first would accept any publication newer than the sample, including a
+    // late answer to the *previous* edit -- exactly the stale read this
+    // function exists to prevent.
+    //
+    // The version-less case used to sleep for the whole bound and then accept
+    // whatever was cached. Polling the publication counter instead is both
+    // faster and stricter.
     const arrived = () => {
-      const publishedSeq = client.getPublishedSeq(uri);
-      if (publishedSeq !== undefined && publishedSeq > seqBeforeSync) return true;
       const publishedVersion = client.getPublishedVersion(uri);
-      return publishedVersion !== undefined && publishedVersion >= syncedVersion;
+      if (syncedVersion !== undefined && publishedVersion !== undefined) {
+        return publishedVersion >= syncedVersion;
+      }
+      const publishedSeq = client.getPublishedSeq(uri);
+      return publishedSeq !== undefined && publishedSeq > seqBeforeSync;
     };
 
     while (!arrived()) {
@@ -405,6 +450,24 @@ export class LspRuntimeManager {
       await delay(Math.min(25, Math.max(1, remaining)));
     }
     return true;
+  }
+
+  /**
+   * Resolve the post-edit diagnostics wait bound for one server.
+   *
+   * Precedence: the server's own `diagnosticsWaitMs`, then the manager-wide
+   * option, then {@link DEFAULT_DIAGNOSTICS_WAIT_MS}. The result is clamped:
+   * this wait sits on the agent's critical path (an edit does not return until
+   * it resolves), and config can come from an untrusted project checkout, so a
+   * hostile value must not be able to stall a turn indefinitely.
+   */
+  private diagnosticsWaitMsFor(serverId: string): number {
+    const configured = this.config.catalog.servers[serverId]?.diagnosticsWaitMs;
+    const resolved =
+      typeof configured === "number" && Number.isFinite(configured) && configured >= 0
+        ? configured
+        : this.diagnosticsWaitMs;
+    return Math.min(resolved, MAX_DIAGNOSTICS_WAIT_MS);
   }
 
   /**
@@ -424,9 +487,24 @@ export class LspRuntimeManager {
     const allDiags = [...diagResult.diagnostics].sort(compareRawDiagnostics);
 
     if (allDiags.length === 0) {
+      // A server without codeActionProvider must not turn a clean file into a
+      // throw: callers use this result to decide whether the file is covered
+      // at all, and a failed fix lookup says nothing about coverage.
+      let codeActions: LspRuntimeFileResult<(CodeAction | Command)[] | null>;
+      try {
+        codeActions = await this.codeAction(filePath, 1, 1, undefined, true);
+      } catch {
+        codeActions = {
+          serverId: diagResult.serverId,
+          rootDir: diagResult.rootDir,
+          filePath: diagResult.filePath,
+          uri: URI.file(filePath).toString(),
+          result: null,
+        };
+      }
       return {
         diagnostics: diagResult,
-        codeActions: await this.codeAction(filePath, 1, 1, undefined, true),
+        codeActions,
         diagnosticActions: [],
       };
     }
