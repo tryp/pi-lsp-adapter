@@ -59,6 +59,10 @@ export function formatLspStatus(snapshot: LspStatusSnapshot): string {
 
   const scope = snapshot.workspaceScopeStats;
   const scopeTotal = scope ? scope.toolRefusals + scope.warmupRefusals + scope.baselineRefusals : 0;
+  if (scope && scope.autoAdded > 0) {
+    lines.push("", "workspace roots added automatically:");
+    for (const root of scope.autoAddedRoots) lines.push(`- ${root}`);
+  }
   if (scope && scopeTotal > 0) {
     lines.push("", "outside-workspace refusals (this session, cumulative):");
     lines.push(`- total: ${scopeTotal} (${scope.distinctPaths} distinct paths)`);

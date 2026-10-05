@@ -49,7 +49,14 @@ function fakeState(runtime: Partial<LspExtensionState["runtimeManager"]> = {}): 
   return {
     ownerId: "test",
     cwd: tempHome,
-    config: { catalog: { servers: {} }, warnings: [], installMode: "auto", warmup: true },
+    config: {
+      catalog: { servers: {} },
+      warnings: [],
+      installMode: "auto",
+      warmup: true,
+      autoWorkspaceRoots: [],
+      autoWorkspaceRootMode: "trusted",
+    },
     installManager: {} as never,
     processRegistry: {} as never,
     runtimeManager: {

@@ -47,6 +47,8 @@ function snapshot(): LspStatusSnapshot {
     config: {
       catalog: BUILTIN_CATALOG,
       warnings: [],
+      autoWorkspaceRoots: [],
+      autoWorkspaceRootMode: "trusted",
       installMode: "prompt",
       warmup: true,
     },

@@ -190,12 +190,14 @@ replace it with a hand-written `rsync --delete`.
 
 ### Top-level config fields
 
-| Field                 | Default    | Behavior                                                                                       |
-| --------------------- | ---------- | ---------------------------------------------------------------------------------------------- |
-| `installMode`         | `"prompt"` | Missing servers are installed only when explicitly requested or interactively confirmed.       |
-| `warmup`              | `true`     | Pi `read` calls for supported source files start matching installed servers in the background. |
-| `servers`             | `{}`       | Per-server overrides merged into the built-in catalog.                                         |
-| `extraWorkspaceRoots` | `[]`       | Extra directories whose files may be queried. The session cwd is always in scope.              |
+| Field                   | Default                             | Behavior                                                                                       |
+| ----------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `installMode`           | `"prompt"`                          | Missing servers are installed only when explicitly requested or interactively confirmed.       |
+| `warmup`                | `true`                              | Pi `read` calls for supported source files start matching installed servers in the background. |
+| `servers`               | `{}`                                | Per-server overrides merged into the built-in catalog.                                         |
+| `extraWorkspaceRoots`   | `[]`                                | Extra directories whose files may be queried. The session cwd is always in scope.              |
+| `autoWorkspaceRoots`    | `~/src`, `~/.pi/worktree-checkouts` | Trees under which an out-of-scope project is added without asking.                             |
+| `autoWorkspaceRootMode` | `"trusted"`                         | `"trusted"`, `"all"`, or `"off"`: how far automatic widening goes.                             |
 
 `installMode` can be:
 
@@ -215,12 +217,26 @@ Tools refuse to start a server for a file that is outside every workspace root. 
 Refusing to start LSP for /checkout/src/index.ts; target is outside workspace /repo. Call lsp_add_workspace_root(directory="/checkout"), then retry
 ```
 
-Two ways to widen the scope:
+Most of the time there is no step to take. A project under one of your own trees is added automatically the first time a tool touches it, because a refusal that names a directory the agent then has to act on costs a turn and can end a session with no LSP tools left in it. `autoWorkspaceRoots` defaults to `~/src` and `~/.pi/worktree-checkouts`, and `autoWorkspaceRootMode` decides how far that goes:
+
+| `autoWorkspaceRootMode` | Behavior                                                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `"trusted"` (default)   | Add the suggested root when it sits under `autoWorkspaceRoots`. Otherwise refuse, with the remedy.               |
+| `"all"`                 | Add any suggested project root. Convenient, and it widens what a server will execute code from, so it is opt-in. |
+| `"off"`                 | Never add automatically; every refusal names the directory to add.                                               |
+
+Two degenerate suggestions are never auto-added: `/` and `$HOME`. A file at `/x.ts` or `~/x.ts` walks up to one of them, and adding either puts a whole filesystem in scope.
+
+Two more ways to widen the scope explicitly:
 
 - `lsp_add_workspace_root <dir>` for the current session. Servers start lazily, per project, on the first query against a file there.
 - `extraWorkspaceRoots` in `~/.pi/agent/lsp.json` for every session. Entries are literal paths, so a directory that holds many checkouts (for example `~/.pi/worktree-checkouts`) brings all of them into scope at once; each checkout still gets its own server root and its own lazily started process.
 
-The pre-edit auto-diag baseline never fails an edit because of this guard: an out-of-scope edit target reports no baseline rather than throwing. Read warmup already ignores out-of-scope targets.
+Every automatic widening is counted (`autoAdded`, plus the roots added) and shows up in `/lsp status` and the session log: silent widening is how a session ends up analyzing four projects it was never told about.
+
+### LSP failures never fail an edit
+
+The auto-diag baseline runs in front of every `edit` and `write`, and an exception escaping that hook fails the tool call — so an out-of-scope path once made a file unwritable. Diagnostics are strictly an enhancement here: the whole handler is guarded, and each failure is counted (`baseline_failed`, `no_client`, `post_edit_failed`) rather than propagated. Read warmup is fire-and-forget and already ignores out-of-scope targets.
 
 Refusals are counted per session and summarized by `/lsp status`, split by what triggered them (LSP tool, read warmup, auto-diag baseline). Each flush appends an `lsp_workspace_scope` entry to the session log with `cumulative` counters for the session and `sinceLastEntry` counters for that batch, so summing entries does not multiply the totals. A failing `appendEntry` (read-only or full session file) leaves the batch pending instead of breaking the caller; the cumulative totals are unaffected.
 

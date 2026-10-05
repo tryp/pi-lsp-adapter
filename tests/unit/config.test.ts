@@ -86,6 +86,62 @@ describe("trust store", () => {
 });
 
 describe("loadLspConfig", () => {
+  it("defaults to auto-adding the user's own trees, tilde-expanded", async () => {
+    const config = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(config.autoWorkspaceRootMode).toBe("trusted");
+    expect(config.autoWorkspaceRoots).toContain(join(tempHome, "src"));
+    expect(config.autoWorkspaceRoots).toContain(join(tempHome, ".pi", "worktree-checkouts"));
+  });
+
+  it("expands ~ in autoWorkspaceRoots, adds to the defaults, and reads the mode", async () => {
+    await writeJson(getUserConfigPath(), {
+      autoWorkspaceRoots: ["~/projects"],
+      autoWorkspaceRootMode: "all",
+    });
+
+    const config = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(config.autoWorkspaceRootMode).toBe("all");
+    expect(config.autoWorkspaceRoots).toContain(join(tempHome, "projects"));
+    // resolve() alone would treat "~/projects" as a directory literally named
+    // "~", which never exists, so the setting would silently do nothing.
+    expect(config.autoWorkspaceRoots).not.toContain("~/projects");
+    // Config adds to the defaults rather than replacing them.
+    expect(config.autoWorkspaceRoots).toContain(join(tempHome, "src"));
+  });
+
+  it("ignores automatic widening settings from an untrusted project", async () => {
+    // These two settings decide what the extension may reach without asking.
+    // A checkout the owner has not trusted must not be able to widen that, the
+    // same way it cannot enable warmup or contribute servers.
+    await writeJson(getProjectConfigPath(projectRoot), {
+      autoWorkspaceRoots: ["/"],
+      autoWorkspaceRootMode: "all",
+    });
+
+    const untrusted = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(untrusted.autoWorkspaceRootMode).toBe("trusted");
+    expect(untrusted.autoWorkspaceRoots).not.toContain("/");
+    expect(untrusted.warnings.join("\n")).toContain("trusted-only project autoWorkspaceRootMode");
+
+    await trustProject(projectRoot);
+
+    const trusted = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(trusted.autoWorkspaceRootMode).toBe("all");
+  });
+
+  it("ignores an invalid autoWorkspaceRootMode with a warning", async () => {
+    await writeJson(getUserConfigPath(), { autoWorkspaceRootMode: "sometimes" });
+
+    const config = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(config.autoWorkspaceRootMode).toBe("trusted");
+    expect(config.warnings).toEqual([expect.stringContaining("autoWorkspaceRootMode")]);
+  });
+
   it("defaults warmup to enabled and lets global config disable it", async () => {
     expect((await loadLspConfig({ cwd: projectRoot, projectRoot })).warmup).toBe(true);
 

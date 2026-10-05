@@ -93,12 +93,25 @@ export interface FiletypeRules {
   extensions?: Record<string, string>;
 }
 
+/**
+ * When an out-of-scope file may be brought into scope without asking.
+ *
+ * - `trusted` (default): only under `autoWorkspaceRoots`, the user's own trees.
+ * - `all`: any suggested project root. Convenient, and it does widen what a
+ *   language server will execute code from, so it is opt-in.
+ * - `off`: never; refusals always name the directory to add.
+ */
+export type AutoWorkspaceRootMode = "trusted" | "all" | "off";
+
 export interface LspConfig {
   installMode?: InstallMode;
   warmup?: boolean;
   servers?: Record<string, Partial<ServerDefinition>>;
   trustedProjects?: string[];
   extraWorkspaceRoots?: string[];
+  /** Directories under which out-of-scope files are auto-added when mode is `trusted`. */
+  autoWorkspaceRoots?: string[];
+  autoWorkspaceRootMode?: AutoWorkspaceRootMode;
 }
 
 export interface InstalledServerMetadata {

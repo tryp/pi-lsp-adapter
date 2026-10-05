@@ -1,9 +1,10 @@
 import { readFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { isNodeError, isPlainObject, isPythonServerId, messageFromError } from "../util/helpers.js";
 import { BUILTIN_CATALOG } from "../registry/builtin.js";
 import { parseServerDefinition } from "../registry/schema.js";
-import type { Catalog, InstallMode, ServerDefinition } from "../registry/schema.js";
+import type { AutoWorkspaceRootMode, Catalog, InstallMode, ServerDefinition } from "../registry/schema.js";
 import { deepClone, deepMerge } from "../util/deepMerge.js";
 import { getProjectConfigPath, getUserConfigPath } from "./paths.js";
 import { isProjectTrusted } from "./trust.js";
@@ -19,6 +20,20 @@ export interface LoadLspConfigResult {
   installMode: InstallMode;
   warmup: boolean;
   extraWorkspaceRoots: string[];
+  autoWorkspaceRoots: string[];
+  autoWorkspaceRootMode: AutoWorkspaceRootMode;
+}
+
+/**
+ * Trees treated as the user's own when auto-adding an out-of-scope project.
+ *
+ * Resolved per call rather than at module load, so a HOME change (tests, and
+ * anyone running pi against a different home) is honored. Deliberately narrow:
+ * these are directories the user creates worktrees and repositories in, not
+ * temp directories or anything that arrived from outside.
+ */
+export function defaultAutoWorkspaceRoots(): string[] {
+  return [join(homedir(), "src"), join(homedir(), ".pi", "worktree-checkouts")];
 }
 
 interface RawLspConfig {
@@ -26,6 +41,8 @@ interface RawLspConfig {
   warmup?: unknown;
   servers?: unknown;
   extraWorkspaceRoots?: unknown;
+  autoWorkspaceRoots?: unknown;
+  autoWorkspaceRootMode?: unknown;
 }
 
 interface ConfigSource {
@@ -36,6 +53,7 @@ interface ConfigSource {
 }
 
 const INSTALL_MODES = new Set<InstallMode>(["prompt", "auto", "off"]);
+const AUTO_ROOT_MODES = new Set<AutoWorkspaceRootMode>(["trusted", "all", "off"]);
 const SAFE_PROJECT_SERVER_FIELDS = new Set([
   "filetypes",
   "rootMarkers",
@@ -68,6 +86,8 @@ export async function loadLspConfig(input: LoadLspConfigInput): Promise<LoadLspC
   let installMode: InstallMode = "prompt";
   let warmup = true;
   let extraWorkspaceRoots: string[] = [];
+  let autoWorkspaceRoots: string[] = defaultAutoWorkspaceRoots();
+  let autoWorkspaceRootMode: AutoWorkspaceRootMode = "trusted";
   const projectRoot = input.projectRoot ?? input.cwd;
   const projectTrusted = await isProjectTrusted(projectRoot);
 
@@ -92,11 +112,39 @@ export async function loadLspConfig(input: LoadLspConfigInput): Promise<LoadLspC
 
     installMode = mergeInstallMode(installMode, config.installMode, source, projectRoot, warnings);
     warmup = mergeWarmup(warmup, config.warmup, source, projectRoot, warnings);
-    extraWorkspaceRoots = mergeExtraWorkspaceRoots(extraWorkspaceRoots, config.extraWorkspaceRoots, source, projectRoot, warnings);
+    extraWorkspaceRoots = mergeExtraWorkspaceRoots(
+      extraWorkspaceRoots,
+      config.extraWorkspaceRoots,
+      source,
+      projectRoot,
+      warnings,
+    );
+    autoWorkspaceRoots = mergeAutoWorkspaceRoots(
+      autoWorkspaceRoots,
+      config.autoWorkspaceRoots,
+      source,
+      projectRoot,
+      warnings,
+    );
+    autoWorkspaceRootMode = mergeAutoWorkspaceRootMode(
+      autoWorkspaceRootMode,
+      config.autoWorkspaceRootMode,
+      source,
+      projectRoot,
+      warnings,
+    );
     mergeServers(catalog, config.servers, source, projectRoot, warnings);
   }
 
-  return { catalog, warnings, installMode, warmup, extraWorkspaceRoots };
+  return {
+    catalog,
+    warnings,
+    installMode,
+    warmup,
+    extraWorkspaceRoots,
+    autoWorkspaceRoots,
+    autoWorkspaceRootMode,
+  };
 }
 
 async function readConfig(source: ConfigSource, warnings: string[]): Promise<RawLspConfig | undefined> {
@@ -203,6 +251,79 @@ function mergeExtraWorkspaceRoots(
   }
 
   return resolved;
+}
+
+/**
+ * Expand a leading `~` so config files stay machine-independent.
+ *
+ * `resolve()` alone would treat "~/src" as a directory literally named "~",
+ * which never exists, and the setting would silently do nothing.
+ */
+export function expandHome(input: string): string {
+  if (input === "~") return homedir();
+  if (input.startsWith("~/") || input.startsWith("~\\")) {
+    return join(homedir(), input.slice(2));
+  }
+  return input;
+}
+
+function mergeAutoWorkspaceRoots(
+  current: string[],
+  value: unknown,
+  source: ConfigSource,
+  projectRoot: string,
+  warnings: string[],
+): string[] {
+  if (value === undefined) return current;
+  // These two settings decide what the extension may reach without asking.
+  // A checkout the session owner has not trusted must not be able to widen
+  // that, exactly as it cannot enable warmup or add servers.
+  if (source.kind === "project" && !source.trustedProjectOverrides) {
+    warnings.push(
+      `Ignoring trusted-only project autoWorkspaceRoots from ${source.path}; run /lsp trust ${projectRoot} to allow them.`,
+    );
+    return current;
+  }
+  if (!Array.isArray(value)) {
+    warnings.push(
+      `Ignoring invalid autoWorkspaceRoots in ${source.label} at ${source.path}: expected an array of strings.`,
+    );
+    return current;
+  }
+  const resolved = [...current];
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      warnings.push(
+        `Ignoring invalid autoWorkspaceRoots entry in ${source.label} at ${source.path}: each entry must be a string.`,
+      );
+      continue;
+    }
+    resolved.push(resolve(expandHome(entry)));
+  }
+  return resolved;
+}
+
+function mergeAutoWorkspaceRootMode(
+  current: AutoWorkspaceRootMode,
+  value: unknown,
+  source: ConfigSource,
+  projectRoot: string,
+  warnings: string[],
+): AutoWorkspaceRootMode {
+  if (value === undefined) return current;
+  if (source.kind === "project" && !source.trustedProjectOverrides) {
+    warnings.push(
+      `Ignoring trusted-only project autoWorkspaceRootMode from ${source.path}; run /lsp trust ${projectRoot} to allow it.`,
+    );
+    return current;
+  }
+  if (typeof value !== "string" || !AUTO_ROOT_MODES.has(value as AutoWorkspaceRootMode)) {
+    warnings.push(
+      `Ignoring invalid autoWorkspaceRootMode in ${source.label} at ${source.path}: expected one of ${[...AUTO_ROOT_MODES].join(", ")}.`,
+    );
+    return current;
+  }
+  return value as AutoWorkspaceRootMode;
 }
 
 function mergeServers(

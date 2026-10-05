@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -13,6 +13,7 @@ import {
 import type { Disposable } from "vscode-jsonrpc";
 import {
   LspRuntimeManager,
+  MAX_AUTO_ADDED_ROOTS,
   MAX_DIAGNOSTICS_WAIT_MS,
   type OutsideWorkspaceRefusal,
 } from "../../src/lsp/runtimeManager.js";
@@ -232,10 +233,9 @@ describe("LspRuntimeManager", () => {
     });
     // The test server's only marker is package.json, so add one that needs the
     // same "sub/inner" joining detectRoot performs.
-    (runtime as unknown as { config: { catalog: { servers: Record<string, { rootMarkers: string[] }> } } }).config.catalog.servers.vtsls!.rootMarkers.push(
-      "sub/marker.txt",
-      "sub\\marker.txt",
-    );
+    (
+      runtime as unknown as { config: { catalog: { servers: Record<string, { rootMarkers: string[] }> } } }
+    ).config.catalog.servers.vtsls!.rootMarkers.push("sub/marker.txt", "sub\\marker.txt");
 
     expect(runtime.suggestWorkspaceRoot(join(marked, "sub", "deep", "index.ts"))).toBe(marked);
   });
@@ -274,10 +274,130 @@ describe("LspRuntimeManager", () => {
     // Both asked twice: the second round is served from the memo.
     for (let round = 0; round < 2; round += 1) {
       expect(runtime.suggestWorkspaceRoot(join(mixedRoot, "main.py"))).toBe(mixedRoot);
-      expect(runtime.suggestWorkspaceRoot(join(mixedRoot, "rust", "lib.rs"))).toBe(
-        join(mixedRoot, "rust"),
-      );
+      expect(runtime.suggestWorkspaceRoot(join(mixedRoot, "rust", "lib.rs"))).toBe(join(mixedRoot, "rust"));
     }
+  });
+
+  it("adds an out-of-scope project root automatically when it is under a trusted tree", async () => {
+    // The refusal that motivated this whole change cost a session every LSP
+    // tool it had left. When the suggested root is one of the user's own
+    // trees, the manager adds it and carries on instead of naming it.
+    const trustedRoot = join(tempDir, "src", "sibling");
+    await mkdir(join(trustedRoot, "src"), { recursive: true });
+    await writeFile(join(trustedRoot, "package.json"), "{}\n", "utf8");
+    await writeFile(join(trustedRoot, "src", "index.ts"), "export const value = 1;\n", "utf8");
+    const added: Array<{ root: string }> = [];
+    const runtime = runtimeManager({
+      autoWorkspaceRoots: [join(tempDir, "src")],
+      autoWorkspaceRootMode: "trusted",
+      onAutoWorkspaceRoot: (info) => added.push(info),
+    });
+
+    const result = await runtime.diagnostics(join(trustedRoot, "src", "index.ts"));
+
+    expect(result.rootDir).toBe(trustedRoot);
+    expect(added).toEqual([{ root: trustedRoot, filePath: join(trustedRoot, "src", "index.ts") }]);
+    expect(runtime.listWorkspaceRoots()).toContain(trustedRoot);
+  });
+
+  it("still refuses an out-of-scope root outside the trusted trees", async () => {
+    const strangerRoot = join(tempDir, "downloads", "untrusted");
+    await mkdir(join(strangerRoot), { recursive: true });
+    await writeFile(join(strangerRoot, "package.json"), "{}\n", "utf8");
+    const outsideFile = join(strangerRoot, "index.ts");
+    await writeFile(outsideFile, "export const value = 1;\n", "utf8");
+    const runtime = runtimeManager({
+      autoWorkspaceRoots: [join(tempDir, "src")],
+      autoWorkspaceRootMode: "trusted",
+    });
+
+    await expect(runtime.diagnostics(outsideFile)).rejects.toThrow("outside workspace");
+    expect(runtime.listWorkspaceRoots()).not.toContain(strangerRoot);
+  });
+
+  it("adds any root in mode=all and none in mode=off", async () => {
+    const looseRoot = join(tempDir, "anywhere");
+    await mkdir(join(looseRoot), { recursive: true });
+    await writeFile(join(looseRoot, "package.json"), "{}\n", "utf8");
+    const outsideFile = join(looseRoot, "index.ts");
+    await writeFile(outsideFile, "export const value = 1;\n", "utf8");
+
+    const off = runtimeManager({ autoWorkspaceRoots: [join(tempDir)], autoWorkspaceRootMode: "off" });
+    await expect(off.diagnostics(outsideFile)).rejects.toThrow("outside workspace");
+
+    const all = runtimeManager({ autoWorkspaceRootMode: "all" });
+    await expect(all.diagnostics(outsideFile)).resolves.toMatchObject({ rootDir: looseRoot });
+  });
+
+  it("never auto-adds the filesystem root or the home directory", async () => {
+    // A file at /x.ts walks up to "/" and a file at ~/x.ts to $HOME. Adding
+    // either puts a whole filesystem in scope, and neither is a project.
+    const runtime = runtimeManager({ autoWorkspaceRootMode: "all" });
+
+    await expect(runtime.diagnostics("/x.ts")).rejects.toThrow("outside workspace");
+    await expect(runtime.diagnostics(join(homedir(), "x.ts"))).rejects.toThrow("outside workspace");
+    expect(runtime.listWorkspaceRoots()).toEqual([projectDir]);
+  });
+
+  it("refuses to auto-add a directory with no project marker above it", async () => {
+    // Adding an unmarked directory leaves the server's detected root outside
+    // the added root, so selectServerForFile falls back to the session cwd and
+    // answers for a different project without erroring. Automatic widening must
+    // not do that; only the agent's own explicit choice may.
+    const plain = join(tempDir, "src", "scratch");
+    await mkdir(plain, { recursive: true });
+    const outsideFile = join(plain, "notes.ts");
+    await writeFile(outsideFile, "export const value = 1;\n", "utf8");
+    const runtime = runtimeManager({
+      autoWorkspaceRoots: [join(tempDir, "src")],
+      autoWorkspaceRootMode: "all",
+    });
+
+    await expect(runtime.diagnostics(outsideFile)).rejects.toThrow("outside workspace");
+    expect(runtime.listWorkspaceRoots()).not.toContain(plain);
+  });
+
+  it("does not follow a symlink out of a trusted tree", async () => {
+    const trusted = join(tempDir, "src", "trusted");
+    const secret = join(tempDir, "secrets");
+    await mkdir(join(trusted), { recursive: true });
+    await mkdir(join(secret), { recursive: true });
+    await writeFile(join(secret, "package.json"), "{}\n", "utf8");
+    const outsideFile = join(secret, "index.ts");
+    await writeFile(outsideFile, "export const value = 1;\n", "utf8");
+    // Lexically the link is inside the trusted tree; its target is not.
+    await symlink(secret, join(trusted, "link"));
+    const runtime = runtimeManager({
+      autoWorkspaceRoots: [trusted],
+      autoWorkspaceRootMode: "trusted",
+    });
+
+    await expect(runtime.diagnostics(join(trusted, "link", "index.ts"))).rejects.toThrow("outside workspace");
+    expect(runtime.listWorkspaceRoots()).toEqual([projectDir]);
+  });
+
+  it("stops adding roots at the cap and falls back to naming the directory", async () => {
+    // Each new project touched is a new root, and every resolvePath scans them
+    // all. A session that keeps meeting projects should get the refusal, not a
+    // scope that grows without bound.
+    const runtime = runtimeManager({ autoWorkspaceRootMode: "all" });
+    let lastError: unknown;
+    for (let i = 0; i < MAX_AUTO_ADDED_ROOTS + 2; i++) {
+      const root = join(tempDir, "projects", `p${i}`);
+      await mkdir(root, { recursive: true });
+      await writeFile(join(root, "package.json"), "{}\n", "utf8");
+      const file = join(root, "index.ts");
+      await writeFile(file, "export const value = 1;\n", "utf8");
+      try {
+        await runtime.diagnostics(file);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    expect(runtime.listWorkspaceRoots().length).toBe(MAX_AUTO_ADDED_ROOTS + 1);
+    // Past the cap the agent is told what to add rather than nothing at all.
+    expect(String(lastError)).toContain("lsp_add_workspace_root");
   });
 
   it("reports every refusal to the outside-workspace counter", async () => {
@@ -366,6 +486,9 @@ function runtimeManager(
     /** Per-server override under test. */
     serverDiagnosticsWaitMs?: number;
     onOutsideWorkspace?: (refusal: OutsideWorkspaceRefusal) => void;
+    onAutoWorkspaceRoot?: (info: { root: string; filePath: string }) => void;
+    autoWorkspaceRoots?: string[];
+    autoWorkspaceRootMode?: "trusted" | "all" | "off";
   } = {},
 ): LspRuntimeManager & {
   registry: LspProcessRegistry;
@@ -385,26 +508,27 @@ function runtimeManager(
     lockfileOptions: { lockfilePath: join(tempDir, "lsp.lock.json") },
     spawner: options.spawner ?? (() => new FakeProcess(nextPid++)),
     connectionFactory: options.connectionFactory ?? ((process) => new FakeConnection(process.pid!)),
-    ...(options.omitDiagnosticsWaitMs
-      ? {}
-      : { diagnosticsWaitMs: options.diagnosticsWaitMs ?? 0 }),
+    ...(options.omitDiagnosticsWaitMs ? {} : { diagnosticsWaitMs: options.diagnosticsWaitMs ?? 0 }),
     requestTimeoutMs: 500,
     shutdownGraceMs: 0,
     ...(options.onOutsideWorkspace ? { onOutsideWorkspace: options.onOutsideWorkspace } : {}),
+    ...(options.onAutoWorkspaceRoot ? { onAutoWorkspaceRoot: options.onAutoWorkspaceRoot } : {}),
+    ...(options.autoWorkspaceRoots ? { autoWorkspaceRoots: options.autoWorkspaceRoots } : {}),
+    ...(options.autoWorkspaceRootMode ? { autoWorkspaceRootMode: options.autoWorkspaceRootMode } : {}),
   }) as LspRuntimeManager & { registry: LspProcessRegistry };
   runtime.registry = registry;
   return runtime;
 }
 
-function config(
-  installMode: LoadLspConfigResult["installMode"],
-  diagnosticsWaitMs?: number,
-): LoadLspConfigResult {
+function config(installMode: LoadLspConfigResult["installMode"], diagnosticsWaitMs?: number): LoadLspConfigResult {
   return {
     catalog: {
       servers: { vtsls: { ...serverDefinition(), diagnosticsWaitMs } },
     },
     warnings: [],
+    extraWorkspaceRoots: [],
+    autoWorkspaceRoots: [],
+    autoWorkspaceRootMode: "trusted",
     installMode,
     warmup: true,
   };
@@ -617,9 +741,9 @@ describe("diagnostics wait bound", () => {
         new FakeConnection(process.pid!, undefined, { publishDelayMs: 5, publishVersion: 1 }),
     });
 
-    const resolved = (
-      runtime as unknown as { diagnosticsWaitMsFor(serverId: string): number }
-    ).diagnosticsWaitMsFor("vtsls");
+    const resolved = (runtime as unknown as { diagnosticsWaitMsFor(serverId: string): number }).diagnosticsWaitMsFor(
+      "vtsls",
+    );
 
     expect(resolved).toBe(MAX_DIAGNOSTICS_WAIT_MS);
   });
@@ -634,8 +758,7 @@ describe("diagnostics wait bound", () => {
 
     const runtime = runtimeManager({
       serverDiagnosticsWaitMs: 2000,
-      connectionFactory: (process) =>
-        new FakeConnection(process.pid!, undefined, { publishDelayMs: 120 }),
+      connectionFactory: (process) => new FakeConnection(process.pid!, undefined, { publishDelayMs: 120 }),
     });
 
     const started = Date.now();
@@ -765,20 +888,14 @@ class FakeConnection implements LspConnection {
   async sendNotification(method: string, params?: unknown): Promise<void> {
     this.notifications.push({ method, params });
     if (!isDidOpenParams(params)) return;
-    if (
-      method !== DidOpenTextDocumentNotification.method &&
-      method !== DidChangeTextDocumentNotification.method
-    ) {
+    if (method !== DidOpenTextDocumentNotification.method && method !== DidChangeTextDocumentNotification.method) {
       return;
     }
 
     // A scripted sequence lets a test give distinct diagnostics to successive
     // publications, which is how a stale cached publication is detected.
     const messages = this.publishOptions.publishMessages;
-    const message =
-      messages && messages.length > 0
-        ? (messages.shift() as string)
-        : "Type mismatch";
+    const message = messages && messages.length > 0 ? (messages.shift() as string) : "Type mismatch";
 
     const publish = () =>
       this.notificationHandlers.get(PublishDiagnosticsNotification.method)?.({
@@ -792,9 +909,7 @@ class FakeConnection implements LspConnection {
           },
         ],
         // Servers may omit `version`; only include it when configured.
-        ...(this.publishOptions.publishVersion === undefined
-          ? {}
-          : { version: this.publishOptions.publishVersion }),
+        ...(this.publishOptions.publishVersion === undefined ? {} : { version: this.publishOptions.publishVersion }),
       });
 
     const delayMs = this.publishOptions.publishDelayMs ?? 0;

@@ -15,6 +15,9 @@ import type { OutsideWorkspaceRefusal } from "../lsp/runtimeManager.js";
  * read.
  */
 interface WorkspaceScopeStats {
+  /** Project roots added automatically, with the file that triggered each. */
+  autoAdded: number;
+  autoAddedRoots: string[];
   /** Refusals from an explicit LSP tool call. */
   toolRefusals: number;
   /** Refusals from the background start triggered by a plain `read`. */
@@ -33,6 +36,8 @@ interface WorkspaceScopeStats {
 
 function emptyStats(): WorkspaceScopeStats {
   return {
+    autoAdded: 0,
+    autoAddedRoots: [],
     toolRefusals: 0,
     warmupRefusals: 0,
     baselineRefusals: 0,
@@ -78,6 +83,20 @@ export function registerWorkspaceScopeStats(pi: ExtensionAPI): void {
   });
 }
 
+/**
+ * Record an out-of-scope project that was added automatically.
+ *
+ * Automatic widening is invisible by construction, which is exactly why it
+ * needs a counter: a session that silently pulled in four sibling checkouts
+ * should be one query, not a git-inspect-and-grep exercise.
+ */
+export function recordAutoWorkspaceRoot(root: string): void {
+  stats.autoAdded += 1;
+  batch.autoAdded += 1;
+  if (!stats.autoAddedRoots.includes(root)) stats.autoAddedRoots.push(root);
+  if (countRefusals(batch) >= FLUSH_EVERY) flushWorkspaceScopeStats();
+}
+
 /** Record one refusal and flush on cadence. */
 export function recordOutsideWorkspaceRefusal(refusal: OutsideWorkspaceRefusal): void {
   const previous = stats.pathHits.get(refusal.filePath) ?? 0;
@@ -111,8 +130,16 @@ export function recordOutsideWorkspaceRefusal(refusal: OutsideWorkspaceRefusal):
   if (countRefusals(batch) >= FLUSH_EVERY) flushWorkspaceScopeStats();
 }
 
+/**
+ * Events that should reach the session log on the next flush.
+ *
+ * Automatic widening counts too. A session that only ever auto-adds never
+ * refuses anything, and a session killed without a clean shutdown would then
+ * leave no record that its scope grew - which is the case this log exists to
+ * survive.
+ */
 function countRefusals(state: WorkspaceScopeStats): number {
-  return state.toolRefusals + state.warmupRefusals + state.baselineRefusals;
+  return state.autoAdded + state.toolRefusals + state.warmupRefusals + state.baselineRefusals;
 }
 
 /**
@@ -132,6 +159,8 @@ export function flushWorkspaceScopeStats(): void {
   try {
     activePi.appendEntry("lsp_workspace_scope", {
       cumulative: {
+        autoAdded: stats.autoAdded,
+        autoAddedRoots: stats.autoAddedRoots,
         toolRefusals: stats.toolRefusals,
         warmupRefusals: stats.warmupRefusals,
         baselineRefusals: stats.baselineRefusals,
@@ -139,6 +168,7 @@ export function flushWorkspaceScopeStats(): void {
         distinctPaths: stats.distinctPaths,
       },
       sinceLastEntry: {
+        autoAdded: batch.autoAdded,
         toolRefusals: batch.toolRefusals,
         warmupRefusals: batch.warmupRefusals,
         baselineRefusals: batch.baselineRefusals,
@@ -163,6 +193,8 @@ export function resetWorkspaceScopeStats(): void {
 
 /** Current cumulative counters, for `/lsp status` and tests. */
 export function getWorkspaceScopeStats(): {
+  autoAdded: number;
+  autoAddedRoots: string[];
   toolRefusals: number;
   warmupRefusals: number;
   baselineRefusals: number;
@@ -171,6 +203,8 @@ export function getWorkspaceScopeStats(): {
   lastSuggestedRoot?: string;
 } {
   return {
+    autoAdded: stats.autoAdded,
+    autoAddedRoots: [...stats.autoAddedRoots],
     toolRefusals: stats.toolRefusals,
     warmupRefusals: stats.warmupRefusals,
     baselineRefusals: stats.baselineRefusals,

@@ -145,6 +145,8 @@ function fakeState(
         },
       },
       warnings: [],
+      autoWorkspaceRoots: [],
+      autoWorkspaceRootMode: "trusted",
       installMode: "prompt",
       warmup: options.warmup ?? true,
     },

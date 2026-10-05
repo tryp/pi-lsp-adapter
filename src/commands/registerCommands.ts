@@ -209,7 +209,7 @@ async function terminateMatchingProcesses(state: LspExtensionState, serverId?: s
 async function buildSnapshot(state: LspExtensionState): Promise<LspStatusSnapshot> {
   const stats = getAutoDiagStats();
   const scope = getWorkspaceScopeStats();
-  const scopeTotal = scope.toolRefusals + scope.warmupRefusals + scope.baselineRefusals;
+  const scopeTotal = scope.autoAdded + scope.toolRefusals + scope.warmupRefusals + scope.baselineRefusals;
   return {
     config: state.config,
     lockfile: await readLockfile(),

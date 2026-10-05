@@ -4,6 +4,7 @@ import type { OutsideWorkspaceRefusal } from "../../src/lsp/runtimeManager.js";
 import {
   flushWorkspaceScopeStats,
   getWorkspaceScopeStats,
+  recordAutoWorkspaceRoot,
   recordOutsideWorkspaceRefusal,
   registerWorkspaceScopeStats,
   resetWorkspaceScopeStats,
@@ -161,6 +162,41 @@ describe("workspace scope stats", () => {
     expect(entries).toHaveLength(0);
     // Cumulative totals survive the failed write, so the flush is retried.
     expect(getWorkspaceScopeStats().toolRefusals).toBe(5);
+  });
+
+  it("records automatically added roots so the widening stays visible", () => {
+    const { pi, entries } = createMockPi();
+    registerWith(pi);
+
+    recordAutoWorkspaceRoot("/checkout/task");
+    recordAutoWorkspaceRoot("/checkout/task");
+    recordAutoWorkspaceRoot("/checkout/other");
+    flushWorkspaceScopeStats();
+
+    const cumulative = entries[0]?.data.cumulative as { autoAdded: number; autoAddedRoots: string[] } | undefined;
+    expect(cumulative).toMatchObject({ autoAdded: 3 });
+    // Distinct roots, so a hot loop on one project cannot bloat the entry.
+    expect(cumulative?.autoAddedRoots).toEqual(["/checkout/task", "/checkout/other"]);
+    // An auto-add is not a refusal: it must not inflate the refusal totals.
+    expect(getWorkspaceScopeStats().toolRefusals).toBe(0);
+  });
+
+  it("flushes an automatic widening on its own cadence", () => {
+    // A session that only ever auto-adds never refuses anything, so a cadence
+    // that counts only refusals leaves no record at all unless the session
+    // shuts down cleanly - which is exactly the case this log exists for.
+    const { pi, entries } = createMockPi();
+    registerWith(pi);
+
+    for (let i = 0; i < 4; i++) recordAutoWorkspaceRoot(`/checkout-${i}`);
+    expect(entries).toHaveLength(0);
+
+    recordAutoWorkspaceRoot("/checkout-final");
+    flushWorkspaceScopeStats();
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.data.cumulative).toMatchObject({ autoAdded: 5 });
+    expect(entries[0]?.data.sinceLastEntry).toMatchObject({ autoAdded: 5 });
   });
 
   it("does not write when nothing was recorded", () => {

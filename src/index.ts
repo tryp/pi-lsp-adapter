@@ -12,6 +12,7 @@ import { LspRuntimeManager } from "./lsp/runtimeManager.js";
 import { registerLspCommand } from "./commands/registerCommands.js";
 import { registerLspTools } from "./tools/registerLspTools.js";
 import {
+  recordAutoWorkspaceRoot,
   recordOutsideWorkspaceRefusal,
   registerWorkspaceScopeStats,
 } from "./tools/workspaceStats.js";
@@ -100,6 +101,9 @@ export default function piAgentLspExtension(pi: ExtensionAPI): void {
         installManager,
         processRegistry,
         extraWorkspaceRoots: config.extraWorkspaceRoots,
+        autoWorkspaceRoots: config.autoWorkspaceRoots,
+        autoWorkspaceRootMode: config.autoWorkspaceRootMode,
+        onAutoWorkspaceRoot: ({ root }) => recordAutoWorkspaceRoot(root),
         // Counted, not just thrown: an unmeasured refusal is a silent loss of
         // the LSP tools for the rest of the session.
         onOutsideWorkspace: recordOutsideWorkspaceRefusal,
