@@ -238,10 +238,28 @@ describe("success and failure formatting", () => {
     expect(result.content[0].text).toContain("Try a different LSP tool");
   });
 
-  it("failure returns concise outside workspace message", () => {
+  it("failure names the escape hatch when the refusal carries no suggestion", () => {
     const err = new Error("/outside is outside workspace.");
     const result = failure("lsp_hover", err);
     expect(result.content[0].text).toContain("outside workspace");
+    // Still name the escape hatch, because "use a file under the current
+    // workspace" reads as "LSP does not work here" and ended the session's use
+    // of the LSP tools.
+    expect(result.content[0].text).toContain("lsp_add_workspace_root");
+  });
+
+  it("failure passes the runtime's suggested root through exactly once", () => {
+    const err = new Error(
+      'Refusing to start LSP for /tmp/sibling/src/index.ts; target is outside workspace /repo. Call lsp_add_workspace_root(directory="/tmp/sibling"), then retry.',
+    );
+    const result = failure("lsp_diagnostics", err);
+    const text = result.content[0].text;
+    // Appending the remedy again produced a self-repeating sentence that reads
+    // like noise, so the exact whole string is asserted, not a substring.
+    expect(text.match(/lsp_add_workspace_root/gu)).toHaveLength(1);
+    expect(text).toBe(
+      'lsp_diagnostics failed: Refusing to start LSP for /tmp/sibling/src/index.ts; target is outside workspace /repo. Call lsp_add_workspace_root(directory="/tmp/sibling"), then retry',
+    );
   });
 
   it("failure strips trailing period from first line", () => {

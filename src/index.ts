@@ -11,6 +11,10 @@ import { LspProcessRegistry } from "./lsp/processRegistry.js";
 import { LspRuntimeManager } from "./lsp/runtimeManager.js";
 import { registerLspCommand } from "./commands/registerCommands.js";
 import { registerLspTools } from "./tools/registerLspTools.js";
+import {
+  recordOutsideWorkspaceRefusal,
+  registerWorkspaceScopeStats,
+} from "./tools/workspaceStats.js";
 import { registerLspWarmup } from "./tools/registerLspWarmup.js";
 import { LspResultCache } from "./tools/resultCache.js";
 import { setLspStatusLine } from "./statusLine.js";
@@ -23,6 +27,7 @@ export default function piAgentLspExtension(pi: ExtensionAPI): void {
   registerLspCommand(pi, () => state);
   registerLspTools(pi, () => state);
   registerLspWarmup(pi, () => state);
+  registerWorkspaceScopeStats(pi);
 
   pi.on("before_agent_start", (event) => {
     if (!state) return;
@@ -95,6 +100,9 @@ export default function piAgentLspExtension(pi: ExtensionAPI): void {
         installManager,
         processRegistry,
         extraWorkspaceRoots: config.extraWorkspaceRoots,
+        // Counted, not just thrown: an unmeasured refusal is a silent loss of
+        // the LSP tools for the rest of the session.
+        onOutsideWorkspace: recordOutsideWorkspaceRefusal,
       });
       const resultCache = new LspResultCache();
 

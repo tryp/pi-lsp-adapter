@@ -11,7 +11,11 @@ import {
   PublishDiagnosticsNotification,
 } from "vscode-languageserver-protocol";
 import type { Disposable } from "vscode-jsonrpc";
-import { LspRuntimeManager, MAX_DIAGNOSTICS_WAIT_MS } from "../../src/lsp/runtimeManager.js";
+import {
+  LspRuntimeManager,
+  MAX_DIAGNOSTICS_WAIT_MS,
+  type OutsideWorkspaceRefusal,
+} from "../../src/lsp/runtimeManager.js";
 import type { LspConnection, LspServerProcess } from "../../src/lsp/client.js";
 import { LspProcessRegistry, type ProcessProbe } from "../../src/lsp/processRegistry.js";
 import type { LspInstallManager } from "../../src/install/manager.js";
@@ -167,6 +171,146 @@ describe("LspRuntimeManager", () => {
     await expect(runtime.registry.list()).resolves.toEqual([]);
   });
 
+  it("names the project root to add when refusing an out-of-scope file", async () => {
+    // The remedy must be the marked project root, not the file's own directory:
+    // adding a deep directory leaves the server's detected root outside the
+    // added root, and selectServerForFile then falls back to the session cwd.
+    const siblingRoot = join(tempDir, "sibling");
+    await mkdir(join(siblingRoot, "src", "deep"), { recursive: true });
+    await writeFile(join(siblingRoot, "package.json"), "{}\n", "utf8");
+    const outsideFile = join(siblingRoot, "src", "deep", "index.ts");
+    await writeFile(outsideFile, "export const outside = 1;\n", "utf8");
+    const runtime = runtimeManager();
+
+    await expect(runtime.diagnostics(outsideFile)).rejects.toThrow(
+      `Call lsp_add_workspace_root(directory="${siblingRoot}"), then retry.`,
+    );
+  });
+
+  it("falls back to the file's directory when no project marker exists above it", async () => {
+    const looseDir = join(tempDir, "loose");
+    await mkdir(looseDir, { recursive: true });
+    const outsideFile = join(looseDir, "scratch.ts");
+    await writeFile(outsideFile, "export const outside = 1;\n", "utf8");
+    const runtime = runtimeManager();
+
+    await expect(runtime.diagnostics(outsideFile)).rejects.toThrow(
+      `Call lsp_add_workspace_root(directory="${looseDir}"), then retry.`,
+    );
+  });
+
+  it("labels a read-triggered warmup refusal as warmup, not a tool query", async () => {
+    // Warmup runs from the plain read/edit/write hook, so counting it under
+    // "from LSP tools" in /lsp status would misreport what actually failed.
+    const outsideFile = join(tempDir, "outside.ts");
+    await writeFile(outsideFile, "export const outside = 1;\n", "utf8");
+    const refusals: OutsideWorkspaceRefusal[] = [];
+    const runtime = runtimeManager({ onOutsideWorkspace: (refusal) => refusals.push(refusal) });
+
+    await expect(runtime.warmupFile(outsideFile)).resolves.toBe(false);
+
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({ filePath: outsideFile, reason: "warmup" });
+  });
+
+  it("suggests a directory target itself rather than its parent", async () => {
+    const outsideDir = join(tempDir, "checkout");
+    await mkdir(join(outsideDir, "src"), { recursive: true });
+    await writeFile(join(outsideDir, "package.json"), "{}\n", "utf8");
+    const runtime = runtimeManager();
+
+    expect(runtime.suggestWorkspaceRoot(outsideDir)).toBe(outsideDir);
+  });
+
+  it("matches multi-segment root markers the same way root detection does", async () => {
+    const marked = join(tempDir, "project-marker");
+    await mkdir(join(marked, "sub"), { recursive: true });
+    await mkdir(join(marked, "sub", "deep"), { recursive: true });
+    await writeFile(join(marked, "sub", "marker.txt"), "x\n", "utf8");
+    const runtime = runtimeManager({
+      onOutsideWorkspace: undefined,
+    });
+    // The test server's only marker is package.json, so add one that needs the
+    // same "sub/inner" joining detectRoot performs.
+    (runtime as unknown as { config: { catalog: { servers: Record<string, { rootMarkers: string[] }> } } }).config.catalog.servers.vtsls!.rootMarkers.push(
+      "sub/marker.txt",
+      "sub\\marker.txt",
+    );
+
+    expect(runtime.suggestWorkspaceRoot(join(marked, "sub", "deep", "index.ts"))).toBe(marked);
+  });
+
+  it("keeps mixed-language directories from sharing a cached suggestion", async () => {
+    // A .py and a .rs in one directory must each be pointed at the root their
+    // own server detects, so the memo key includes the marker set, not just
+    // the directory.
+    const mixedRoot = join(tempDir, "mixed");
+    await mkdir(join(mixedRoot, "rust"), { recursive: true });
+    await writeFile(join(mixedRoot, "pyproject.toml"), "{}\n", "utf8");
+    await writeFile(join(mixedRoot, "rust", "Cargo.toml"), "{}\n", "utf8");
+    const runtime = runtimeManager();
+    const servers = (
+      runtime as unknown as {
+        config: {
+          catalog: {
+            servers: Record<string, { id: string; rootMarkers: string[]; filetypes: string[] }>;
+          };
+        };
+      }
+    ).config.catalog.servers;
+    servers.pyright = {
+      ...servers.vtsls!,
+      id: "pyright",
+      filetypes: ["python"],
+      rootMarkers: ["pyproject.toml"],
+    };
+    servers.rustAnalyzer = {
+      ...servers.vtsls!,
+      id: "rustAnalyzer",
+      filetypes: ["rust"],
+      rootMarkers: ["Cargo.toml"],
+    };
+
+    // Both asked twice: the second round is served from the memo.
+    for (let round = 0; round < 2; round += 1) {
+      expect(runtime.suggestWorkspaceRoot(join(mixedRoot, "main.py"))).toBe(mixedRoot);
+      expect(runtime.suggestWorkspaceRoot(join(mixedRoot, "rust", "lib.rs"))).toBe(
+        join(mixedRoot, "rust"),
+      );
+    }
+  });
+
+  it("reports every refusal to the outside-workspace counter", async () => {
+    const outsideFile = join(tempDir, "outside.ts");
+    await writeFile(outsideFile, "export const outside = 1;\n", "utf8");
+    const refusals: OutsideWorkspaceRefusal[] = [];
+    const runtime = runtimeManager({ onOutsideWorkspace: (refusal) => refusals.push(refusal) });
+
+    await expect(runtime.diagnostics(outsideFile)).rejects.toThrow("outside workspace");
+
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({
+      filePath: outsideFile,
+      reason: "tool",
+    });
+    expect(refusals[0]?.workspaceRoots).toEqual([projectDir]);
+  });
+
+  it("returns no baseline instead of throwing when an edit target is out of scope", async () => {
+    // Regression guard for the edit-tool outage: the auto-diag pre-edit hook
+    // calls cachedDiagnostics for every edit, so a throw here made any file
+    // outside the workspace unwritable, not merely unanalyzable.
+    const outsideFile = join(tempDir, "outside.ts");
+    await writeFile(outsideFile, "export const outside = 1;\n", "utf8");
+    const refusals: OutsideWorkspaceRefusal[] = [];
+    const runtime = runtimeManager({ onOutsideWorkspace: (refusal) => refusals.push(refusal) });
+
+    expect(runtime.cachedDiagnostics(outsideFile)).toBeUndefined();
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toMatchObject({ filePath: outsideFile, reason: "auto-diag-baseline" });
+    await expect(runtime.registry.list()).resolves.toEqual([]);
+  });
+
   it("queries only active clients for workspace symbols when no server id is provided", async () => {
     const connections: FakeConnection[] = [];
     const runtime = runtimeManager({
@@ -221,6 +365,7 @@ function runtimeManager(
     omitDiagnosticsWaitMs?: boolean;
     /** Per-server override under test. */
     serverDiagnosticsWaitMs?: number;
+    onOutsideWorkspace?: (refusal: OutsideWorkspaceRefusal) => void;
   } = {},
 ): LspRuntimeManager & {
   registry: LspProcessRegistry;
@@ -245,6 +390,7 @@ function runtimeManager(
       : { diagnosticsWaitMs: options.diagnosticsWaitMs ?? 0 }),
     requestTimeoutMs: 500,
     shutdownGraceMs: 0,
+    ...(options.onOutsideWorkspace ? { onOutsideWorkspace: options.onOutsideWorkspace } : {}),
   }) as LspRuntimeManager & { registry: LspProcessRegistry };
   runtime.registry = registry;
   return runtime;

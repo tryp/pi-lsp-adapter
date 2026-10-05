@@ -861,6 +861,9 @@ function messageFromError(error: unknown): string {
   return conciseExpectedError(baseMessageFromError(error));
 }
 
+/** `lsp_add_workspace_root(directory="...")` clause emitted by the runtime. */
+const SUGGESTED_ROOT_PATTERN = /lsp_add_workspace_root\(directory="([^"]+)"\)/u;
+
 function conciseExpectedError(message: string): string {
   const trimmed = message.trim();
   const firstLine = firstMeaningfulLine(trimmed);
@@ -883,7 +886,15 @@ function conciseExpectedError(message: string): string {
   }
 
   if (/outside workspace/iu.test(trimmed)) {
-    return `${firstLine} Use a file under the current workspace.`;
+    // The runtime error already carries the remedy, so this layer only has to
+    // supply one when it is missing. Appending unconditionally printed it twice,
+    // which is exactly the kind of noise that trains a model to skip the hint.
+    // "Use a file under the current workspace" was worse still: measured over
+    // 300 recent sessions, 44 refusals and zero recoveries, because nothing
+    // ever named the escape hatch.
+    const suggested = SUGGESTED_ROOT_PATTERN.exec(trimmed);
+    if (suggested) return firstLine;
+    return `${firstLine} Call lsp_add_workspace_root(directory="<the file's project root>"), then retry.`;
   }
 
   if (/timed out after \d+ms/iu.test(trimmed)) {

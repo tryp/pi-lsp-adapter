@@ -161,7 +161,7 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       // Starting a client here is deliberate: it is the only way to have an
       // accurate pre-edit baseline for a file nothing has opened yet, and the
       // edit is allowed to wait for it.
-      const result = await state.runtimeManager.diagnostics(filePath);
+      const result = await state.runtimeManager.diagnostics(filePath, "auto-diag-baseline");
       // `diagnostics: []` means either "clean" or "nothing published yet".
       // Recording the latter as a baseline would blame every pre-existing
       // error on this edit, so require an actual publication.

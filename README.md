@@ -190,11 +190,12 @@ replace it with a hand-written `rsync --delete`.
 
 ### Top-level config fields
 
-| Field         | Default    | Behavior                                                                                       |
-| ------------- | ---------- | ---------------------------------------------------------------------------------------------- |
-| `installMode` | `"prompt"` | Missing servers are installed only when explicitly requested or interactively confirmed.       |
-| `warmup`      | `true`     | Pi `read` calls for supported source files start matching installed servers in the background. |
-| `servers`     | `{}`       | Per-server overrides merged into the built-in catalog.                                         |
+| Field                 | Default    | Behavior                                                                                       |
+| --------------------- | ---------- | ---------------------------------------------------------------------------------------------- |
+| `installMode`         | `"prompt"` | Missing servers are installed only when explicitly requested or interactively confirmed.       |
+| `warmup`              | `true`     | Pi `read` calls for supported source files start matching installed servers in the background. |
+| `servers`             | `{}`       | Per-server overrides merged into the built-in catalog.                                         |
+| `extraWorkspaceRoots` | `[]`       | Extra directories whose files may be queried. The session cwd is always in scope.              |
 
 `installMode` can be:
 
@@ -205,6 +206,23 @@ replace it with a hand-written `rsync --delete`.
 | `off`    | Never install automatically. Use system commands or explicit installs only. |
 
 `warmup` never prompts and never installs missing servers. It only prepares already-installed servers after Pi reads a matching source file. `lazy` still means servers do not start at session startup.
+
+### Files outside the workspace
+
+Tools refuse to start a server for a file that is outside every workspace root. The refusal names the directory to add, and it names the _project_ directory rather than the file's own directory: a server resolves its root from project markers, so adding only `src/agents` would leave the detected root outside the added root and the query would run against the session cwd instead.
+
+```
+Refusing to start LSP for /checkout/src/index.ts; target is outside workspace /repo. Call lsp_add_workspace_root(directory="/checkout"), then retry
+```
+
+Two ways to widen the scope:
+
+- `lsp_add_workspace_root <dir>` for the current session. Servers start lazily, per project, on the first query against a file there.
+- `extraWorkspaceRoots` in `~/.pi/agent/lsp.json` for every session. Entries are literal paths, so a directory that holds many checkouts (for example `~/.pi/worktree-checkouts`) brings all of them into scope at once; each checkout still gets its own server root and its own lazily started process.
+
+The pre-edit auto-diag baseline never fails an edit because of this guard: an out-of-scope edit target reports no baseline rather than throwing. Read warmup already ignores out-of-scope targets.
+
+Refusals are counted per session and summarized by `/lsp status`, split by what triggered them (LSP tool, read warmup, auto-diag baseline). Each flush appends an `lsp_workspace_scope` entry to the session log with `cumulative` counters for the session and `sinceLastEntry` counters for that batch, so summing entries does not multiply the totals. A failing `appendEntry` (read-only or full session file) leaves the batch pending instead of breaking the caller; the cumulative totals are unaffected.
 
 ### Common config snippets
 
@@ -546,6 +564,7 @@ This only removes Pi-managed install state. It does not remove external system/M
 - A language server must support the requested LSP capability for the matching tool to return data.
 - First explicit LSP use can still be slower while a server starts, initializes, or installs, especially when warmup is disabled or the server was not installed when the file was read.
 - `lsp_workspace_symbols` searches active clients by default; pass `serverId` to start/query a specific configured server.
+- Files outside every workspace root cannot be queried until their project root is added; see [Files outside the workspace](#files-outside-the-workspace).
 - Pagination result IDs are not persistent and can expire. Re-run the original LSP query if `lsp_more` says the cached result is gone.
 
 ## License

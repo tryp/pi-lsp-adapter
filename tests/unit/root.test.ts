@@ -72,4 +72,13 @@ describe("detectRoot", () => {
     const root = await detectRoot(join(repo, "apps/web/src/app.ts"), ["missing.marker"]);
     expect(root).toBeUndefined();
   });
+
+  it("ignores an absolute marker, which cannot discriminate between candidates", async () => {
+    // An absolute marker exists identically for every candidate directory, so
+    // honoring it would make the walk match the file's own directory.
+    const root = await detectRoot(join(repo, "apps/web/src/app.ts"), ["/etc/hostname", "tsconfig.json"]);
+
+    expect(root?.marker).toBe("tsconfig.json");
+    expect(root?.rootDir).toBe(join(repo, "apps/web"));
+  });
 });

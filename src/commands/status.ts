@@ -5,6 +5,7 @@ import { DEFAULT_DIAGNOSTICS_WAIT_MS } from "../lsp/runtimeManager.js";
 import type { ServerDefinition } from "../registry/schema.js";
 // Type-only: erased at runtime, so no import cycle with the tool registration.
 import type { getAutoDiagStats } from "../tools/registerLspTools.js";
+import type { getWorkspaceScopeStats } from "../tools/workspaceStats.js";
 
 export interface LspStatusSnapshot {
   config: LoadLspConfigResult;
@@ -12,6 +13,8 @@ export interface LspStatusSnapshot {
   processes: LspProcessEntry[];
   /** Cumulative auto-diag outcomes, when auto-diag has run this session. */
   autoDiagStats?: ReturnType<typeof getAutoDiagStats>;
+  /** Cumulative outside-workspace refusals for this session. */
+  workspaceScopeStats?: ReturnType<typeof getWorkspaceScopeStats>;
 }
 
 export function formatLspStatus(snapshot: LspStatusSnapshot): string {
@@ -52,6 +55,22 @@ export function formatLspStatus(snapshot: LspStatusSnapshot): string {
     );
     lines.push(`- no client for file: ${stats.no_client}`);
     lines.push(`- failed edits: ${stats.edit_failed}`);
+  }
+
+  const scope = snapshot.workspaceScopeStats;
+  const scopeTotal = scope ? scope.toolRefusals + scope.warmupRefusals + scope.baselineRefusals : 0;
+  if (scope && scopeTotal > 0) {
+    lines.push("", "outside-workspace refusals (this session, cumulative):");
+    lines.push(`- total: ${scopeTotal} (${scope.distinctPaths} distinct paths)`);
+    lines.push(`- from LSP tools: ${scope.toolRefusals}`);
+    lines.push(`- from read warmup: ${scope.warmupRefusals}`);
+    lines.push(`- from auto-diag baseline: ${scope.baselineRefusals}`);
+    if (scope.repeats > 0) {
+      lines.push(`- repeat hits on an already-refused path: ${scope.repeats}`);
+    }
+    if (scope.lastSuggestedRoot) {
+      lines.push(`- last suggested root: ${scope.lastSuggestedRoot}`);
+    }
   }
 
   return lines.join("\n");

@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { access } from "node:fs/promises";
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -42,6 +43,19 @@ export async function pathExists(path: string): Promise<boolean> {
   try {
     await access(path);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether a path is an existing directory.
+ *
+ * Synchronous because the caller is the synchronous out-of-scope refusal path.
+ */
+export function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
   } catch {
     return false;
   }

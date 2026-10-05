@@ -177,7 +177,9 @@ describe("auto-diag baseline handling", () => {
     const { handlers, sendMessage } = setup(state);
 
     await handlers.get("tool_call")!(editCall("first", "/repo/first.py"));
-    expect(diagnostics).toHaveBeenCalledWith("/repo/first.py");
+    // The reason matters: this refresh belongs to the auto-diag baseline, not
+    // to an LSP query the agent asked for.
+    expect(diagnostics).toHaveBeenCalledWith("/repo/first.py", "auto-diag-baseline");
     await handlers.get("tool_result")!(editResult("first", "/repo/first.py"));
 
     expect(autoDiagBody(sendMessage)).toContain("introduced");

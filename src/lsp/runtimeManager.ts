@@ -1,6 +1,7 @@
+import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
-import { delay } from "../util/helpers.js";
+import { dirname, isAbsolute, parse, relative, resolve } from "node:path";
+import { delay, isDirectory } from "../util/helpers.js";
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
@@ -19,7 +20,7 @@ import type {
 } from "vscode-languageserver-protocol";
 import { URI } from "vscode-uri";
 import { detectFiletype } from "../detect/filetypes.js";
-import { detectRoot } from "../detect/root.js";
+import { detectRoot, markerPath } from "../detect/root.js";
 import type { LoadLspConfigResult } from "../config/loadConfig.js";
 import type { LspInstallManager } from "../install/manager.js";
 import { readLockfile, type LockfileOptions } from "../install/lockfile.js";
@@ -53,6 +54,43 @@ export interface LspRuntimeManagerOptions {
   diagnosticsWaitMs?: number;
   shutdownGraceMs?: number;
   extraWorkspaceRoots?: string[];
+  /**
+   * Called just before an outside-workspace refusal is raised.
+   *
+   * A refusal is a silent capability loss for the rest of the session unless
+   * something counts it: session analysis over 300 recent sessions found 44
+   * refusals with zero recoveries, because no session saw the remedy and never
+   * called an LSP tool again. Wiring this to a counter turns that loss into a
+   * query instead of an archaeology dig.
+   */
+  onOutsideWorkspace?: (refusal: OutsideWorkspaceRefusal) => void;
+}
+
+/**
+ * Details of one refused out-of-scope file, including the remedy.
+ */
+export interface OutsideWorkspaceRefusal {
+  /** Absolute path that was refused. */
+  filePath: string;
+  /** Roots that were in scope when the refusal happened. */
+  workspaceRoots: string[];
+  /**
+   * Directory the caller should add with `lsp_add_workspace_root`.
+   *
+   * The nearest ancestor holding a project marker (package.json, pyproject.toml,
+   * .git, ...), so adding it brings a whole project into scope rather than one
+   * file at a time. Falls back to the file's own directory.
+   */
+  suggestedRoot: string;
+  /**
+   * Which code path hit the guard.
+   *
+   * `tool` is a real LSP query the agent asked for. `warmup` is the background
+   * start triggered by a plain `read` of a supported source file.
+   * `auto-diag-baseline` is the pre-edit diagnostics snapshot, which is
+   * best-effort by contract and must never fail the edit that triggered it.
+   */
+  reason: "tool" | "warmup" | "auto-diag-baseline";
 }
 
 /**
@@ -183,9 +221,12 @@ export class LspRuntimeManager {
   private readonly requestTimeoutMs: number;
   private readonly diagnosticsWaitMs: number;
   private readonly shutdownGraceMs: number;
+  private readonly onOutsideWorkspace?: (refusal: OutsideWorkspaceRefusal) => void;
   private readonly clients = new Map<string, LspClient>();
   private readonly starting = new Map<string, Promise<ClientTarget>>();
   private readonly filetypeCache = new Map<string, string>();
+  /** Memoized out-of-scope suggestions, keyed by target directory. */
+  private readonly suggestionCache = new Map<string, string>();
 
   constructor(options: LspRuntimeManagerOptions) {
     this.cwd = options.cwd;
@@ -204,6 +245,7 @@ export class LspRuntimeManager {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.diagnosticsWaitMs = options.diagnosticsWaitMs ?? DEFAULT_DIAGNOSTICS_WAIT_MS;
     this.shutdownGraceMs = options.shutdownGraceMs ?? 1_000;
+    this.onOutsideWorkspace = options.onOutsideWorkspace;
   }
 
   async startServer(
@@ -312,7 +354,7 @@ export class LspRuntimeManager {
 
   async warmupFile(filePath: string): Promise<boolean> {
     try {
-      const selected = await this.selectServerForFile(filePath);
+      const selected = await this.selectServerForFile(filePath, "warmup");
       const target = await this.ensureClient({
         server: selected.server,
         rootDir: selected.rootDir,
@@ -345,7 +387,20 @@ export class LspRuntimeManager {
    * another client's diagnostics.
    */
   cachedDiagnostics(filePath: string): Diagnostic[] | undefined {
-    const resolvedPath = this.resolvePath(filePath);
+    // A baseline lookup is best-effort by contract ("returns undefined when
+    // there is no usable baseline"), so an out-of-scope path returns undefined
+    // here instead of throwing. Letting it throw took the edit tool down with
+    // it: the auto-diag pre-edit hook calls this for every edit, so a single
+    // refused path made the file unwritable, not merely unanalyzable.
+    let resolvedPath: string;
+    try {
+      resolvedPath = this.resolvePath(filePath, "auto-diag-baseline");
+    } catch (error) {
+      if (error instanceof LspRuntimeError && error.code === "outside-workspace") {
+        return undefined;
+      }
+      throw error;
+    }
     const uri = URI.file(resolvedPath).toString();
     const candidates = [...this.clients.values()].filter(
       (entry) => !entry.isExited && entry.hasDocument(uri),
@@ -372,8 +427,11 @@ export class LspRuntimeManager {
     return client.getPublishedDiagnostics(uri);
   }
 
-  async diagnostics(filePath: string): Promise<LspDiagnosticsResult> {
-    const target = await this.prepareFileTarget(filePath);
+  async diagnostics(
+    filePath: string,
+    reason: OutsideWorkspaceRefusal["reason"] = "tool",
+  ): Promise<LspDiagnosticsResult> {
+    const target = await this.prepareFileTarget(filePath, reason);
     const published = await this.waitForPublishedDiagnostics(
       target.client,
       target.uri,
@@ -1050,8 +1108,9 @@ export class LspRuntimeManager {
 
   private async prepareFileTarget(
     filePath: string,
+    reason: OutsideWorkspaceRefusal["reason"] = "tool",
   ): Promise<SelectedServer & { client: LspClient; uri: string; seqBeforeSync: number }> {
-    const selected = await this.selectServerForFile(filePath);
+    const selected = await this.selectServerForFile(filePath, reason);
     return this.attachClient(selected);
   }
 
@@ -1087,8 +1146,11 @@ export class LspRuntimeManager {
     return { ...selected, client: target.client, uri, seqBeforeSync };
   }
 
-  private async selectServerForFile(filePath: string): Promise<SelectedServer> {
-    const resolvedPath = this.resolvePath(filePath);
+  private async selectServerForFile(
+    filePath: string,
+    reason: OutsideWorkspaceRefusal["reason"] = "tool",
+  ): Promise<SelectedServer> {
+    const resolvedPath = this.resolvePath(filePath, reason);
     const text = await readFile(resolvedPath, "utf8");
     const cached = this.filetypeCache.get(resolvedPath);
     const filetype =
@@ -1304,17 +1366,116 @@ export class LspRuntimeManager {
     return stopped;
   }
 
-  private resolvePath(filePath: string): string {
+  private resolvePath(filePath: string, reason: OutsideWorkspaceRefusal["reason"] = "tool"): string {
     const resolvedPath = isAbsolute(filePath)
       ? resolve(filePath)
       : resolve(this.cwd, filePath);
     if (!this.isInsideAnyWorkspace(resolvedPath)) {
+      const suggestedRoot = this.suggestWorkspaceRoot(resolvedPath);
+      // A counter must not be able to change control flow: appendEntry is
+      // synchronous file I/O and can throw (EACCES, ENOSPC, closed session).
+      // Losing one refusal sample is acceptable; losing the edit is not.
+      try {
+        this.onOutsideWorkspace?.({
+          filePath: resolvedPath,
+          workspaceRoots: this.listWorkspaceRoots(),
+          suggestedRoot,
+          reason,
+        });
+      } catch {
+        // Counters are diagnostics, not behaviour.
+      }
+      // The remedy goes in the message itself, with the parameter name: an
+      // older version said only "use a file under the current workspace", which
+      // reads as "LSP does not work here" and cost every session its LSP tools.
       throw new LspRuntimeError(
-        `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd}.`,
+        `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd}. ` +
+          `Call lsp_add_workspace_root(directory="${suggestedRoot}"), then retry.`,
         "outside-workspace",
       );
     }
     return resolvedPath;
+  }
+
+  /**
+   * Directory to suggest when a file is out of scope: the nearest ancestor that
+   * looks like a project root, else the file's own directory.
+   *
+   * The project-root part is not cosmetic. Adding a deep directory such as
+   * `src/agents` still leaves the server's detected root (the repo root, found
+   * by marker) outside the added root, and `selectServerForFile` then falls
+   * back to the session cwd -- so the query would run against the wrong
+   * project. Suggesting the marked ancestor avoids that trap.
+   *
+   * Synchronous because `resolvePath` is on the synchronous `cachedDiagnostics`
+   * path, and memoized per directory because refusals repeat on every read and
+   * every edit of an out-of-scope file.
+   */
+  suggestWorkspaceRoot(filePath: string): string {
+    const resolvedPath = isAbsolute(filePath) ? resolve(filePath) : resolve(this.cwd, filePath);
+    // An agent that passes a directory to an LSP tool should be told to add
+    // that directory, not its parent.
+    const startDir = isDirectory(resolvedPath) ? resolvedPath : dirname(resolvedPath);
+    const markers = this.rootMarkersFor(resolvedPath);
+    // The answer depends on the marker set as well as the directory: a mixed
+    // language project can hold a .py and a .ts side by side, and each must be
+    // pointed at the root its own server would detect. A directory-only key
+    // would hand the Rust file the Python file's answer.
+    const cacheKey = `${startDir}\0${markers.join(",")}`;
+    const cached = this.suggestionCache.get(cacheKey);
+    if (cached) return cached;
+
+    const filesystemRoot = parse(startDir).root;
+    const suggestion = this.walkToMarkedAncestor(startDir, markers, filesystemRoot);
+    // Bounded rather than evicted: a session that touches hundreds of
+    // out-of-scope directories is a pathology, and dropping the cache is
+    // cheaper than tracking recency.
+    if (this.suggestionCache.size >= 512) this.suggestionCache.clear();
+    this.suggestionCache.set(cacheKey, suggestion);
+    return suggestion;
+  }
+
+  private walkToMarkedAncestor(
+    startDir: string,
+    markers: string[],
+    filesystemRoot: string,
+  ): string {
+    let currentDir = startDir;
+    for (;;) {
+      for (const marker of markers) {
+        const candidate = markerPath(currentDir, marker);
+        if (candidate !== undefined && existsSync(candidate)) return currentDir;
+      }
+      if (currentDir === filesystemRoot) return startDir;
+      currentDir = dirname(currentDir);
+    }
+  }
+
+  /**
+   * Root markers to search for this file, preferring the server that would
+   * actually run.
+   *
+   * A union is wrong in a mixed-language project: with a `.git` at the repo
+   * root and a `Cargo.toml` in `sub/rust`, a refused Python file would be told
+   * to add `sub/rust`, and the Python server's marker walk would still land on
+   * the repo root, which is outside the added root, so the query would silently
+   * run against the session cwd instead.
+   */
+  private rootMarkersFor(filePath: string): string[] {
+    const filetype = detectFiletype({ path: filePath });
+    const server =
+      (filetype
+        ? Object.values(this.config.catalog.servers).find((entry) =>
+            entry.filetypes.includes(filetype),
+          )
+        : undefined) ?? undefined;
+    if (server) return server.rootMarkers;
+
+    const markers = new Set<string>();
+    for (const entry of Object.values(this.config.catalog.servers)) {
+      for (const marker of entry.rootMarkers) markers.add(marker);
+    }
+    return [...markers];
   }
 
   private isInsideAnyWorkspace(targetPath: string): boolean {
