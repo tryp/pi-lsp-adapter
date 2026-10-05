@@ -42,7 +42,7 @@ import { ImpactParams, resolveSymbols, analyzeImpact, formatAmbiguity } from "./
 // An absent baseline is recorded explicitly rather than by omitting the key,
 // because the diff must NOT treat "we failed to snapshot" as "the file was
 // clean" -- doing so reports every pre-existing error as newly introduced.
-type BeforeBaseline = { diagnostics: Diagnostic[] } | { diagnostics: null };
+type BeforeBaseline = { diagnostics: Diagnostic[] } | { diagnostics: null; failed?: boolean };
 
 const pendingBeforeDiags = new Map<string, BeforeBaseline>();
 
@@ -59,7 +59,17 @@ type AutoDiagOutcome =
   | "no_client"
   | "not_published"
   | "no_new_errors"
-  | "edit_failed";
+  | "edit_failed"
+  /** The post-edit comparison itself threw. */
+  | "post_edit_failed"
+  /**
+   * The baseline machinery itself threw.
+   *
+   * Previously indistinguishable from "no baseline", which is how a broken
+   * snapshot path could look like a healthy one that simply had nothing to
+   * compare against.
+   */
+  | "baseline_failed";
 
 const autoDiagStats = {
   edits: 0,
@@ -69,6 +79,8 @@ const autoDiagStats = {
   not_published: 0,
   no_new_errors: 0,
   edit_failed: 0,
+  baseline_failed: 0,
+  post_edit_failed: 0,
   /** Edits handled since the last persisted snapshot. */
   unflushed: 0,
 } satisfies Record<AutoDiagOutcome | "edits" | "unflushed", number>;
@@ -116,8 +128,18 @@ function flushAutoDiagStats(pi: ExtensionAPI): void {
   if (autoDiagStats.unflushed === 0) return;
   // Zero after the write, not before: appendEntry is the one call here that
   // can throw, and zeroing first would lose the batch it failed to record.
-  pi.appendEntry("auto_diag_stats", { ...autoDiagStats });
-  autoDiagStats.unflushed = 0;
+  //
+  // And when it does throw, the exception must not escape. This function is
+  // reached from the auto-diag hooks, including from inside their catch
+  // blocks, and an exception escaping a tool_call handler fails that tool
+  // call: the outage this file exists to prevent would move into its own
+  // failure path. Losing a stats batch is the right trade.
+  try {
+    pi.appendEntry("auto_diag_stats", { ...autoDiagStats });
+    autoDiagStats.unflushed = 0;
+  } catch {
+    // Leave the batch pending: the next flush, or shutdown, may succeed.
+  }
 }
 
 function sortDiags(a: Diagnostic, b: Diagnostic): number {
@@ -140,6 +162,13 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
   });
 
   // Snapshot pre-mutation diagnostics so we can diff post-mutation.
+  //
+  // Nothing in here may throw. This handler runs in front of every edit and
+  // write, and an exception escaping a tool_call handler fails the tool call:
+  // an out-of-scope path once made such a file unwritable, because
+  // cachedDiagnostics() used the same throwing path resolution as the LSP
+  // tools. Diagnostics are an enhancement here, so the whole body is guarded
+  // and every failure is recorded rather than propagated.
   pi.on("tool_call", async (event) => {
     if (event.toolName !== "edit" && event.toolName !== "write") return;
     const filePath = event.input.path;
@@ -151,13 +180,13 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
     const cacheKey = `${event.toolCallId}:${filePath}`;
     if (!pi.getFlag("auto-diag")) return;
 
-    const cached = state.runtimeManager.cachedDiagnostics(filePath);
-    if (cached !== undefined) {
-      pendingBeforeDiags.set(cacheKey, { diagnostics: cached });
-      return;
-    }
-
     try {
+      const cached = state.runtimeManager.cachedDiagnostics(filePath);
+      if (cached !== undefined) {
+        pendingBeforeDiags.set(cacheKey, { diagnostics: cached });
+        return;
+      }
+
       // Starting a client here is deliberate: it is the only way to have an
       // accurate pre-edit baseline for a file nothing has opened yet, and the
       // edit is allowed to wait for it.
@@ -169,150 +198,171 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
         diagnostics: result.published ? result.diagnostics : null,
       });
     } catch {
-      pendingBeforeDiags.set(cacheKey, { diagnostics: null });
+      // No usable baseline, and the reason is not "the file was clean". The
+      // failure is carried on the entry so the post-edit hook does not also
+      // count this edit as a `no_baseline` outcome: one edit, one outcome.
+      pendingBeforeDiags.set(cacheKey, { diagnostics: null, failed: true });
+      recordAutoDiagOutcome(pi, "baseline_failed");
     }
   });
 
   // Compare post-mutation diagnostics against cached pre-state; steer on new errors.
+  //
+  // Guarded for the same reason as the pre-edit hook. The write has already
+  // happened by now, so a throw here cannot lose work, but it would surface as
+  // a tool error and hide the real outcome.
   pi.on("tool_result", async (event, _ctx) => {
-    // Clear the pending baseline on EVERY result path. Failed or blocked edits
-    // are common, and leaving their entry behind would grow this module-global
-    // map for the lifetime of the session.
-    const resultPath = (event.input as { path?: string } | undefined)?.path;
-    const resultKey =
-      resultPath && event.toolCallId ? `${event.toolCallId}:${resultPath}` : undefined;
-    const before = resultKey ? pendingBeforeDiags.get(resultKey) : undefined;
-    if (resultKey) pendingBeforeDiags.delete(resultKey);
-
-    if (event.toolName !== "edit" && event.toolName !== "write") return;
-
-    const enabled = pi.getFlag("auto-diag");
-    if (!enabled) return;
-
-    if (event.isError) {
-      recordAutoDiagOutcome(pi, "edit_failed");
-      return;
-    }
-
-    const filePath = resultPath;
-    if (!filePath) return;
-
-    const state = getState();
-    if (!state) return;
-
-    // No baseline was captured (no live client for this file yet), so we
-    // cannot tell pre-existing errors from newly introduced ones. Stay silent
-    // rather than reporting the file's whole error set as "new".
-    if (!before || before.diagnostics === null) {
-      recordAutoDiagOutcome(pi, "no_baseline");
-      return;
-    }
-
-    // Run diagnostics + query code actions on post-mutation state. This throws
-    // only when the file has no live LSP client at all; a failed code-action
-    // lookup degrades to "no fix annotations" inside diagnosticsWithFixes, so
-    // it cannot be miscounted as missing coverage.
-    let afterResult: {
-      diagnostics: LspDiagnosticsResult;
-      diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }>;
-    };
     try {
-      afterResult = await state.runtimeManager.diagnosticsWithFixes(filePath);
+      // Clear the pending baseline on EVERY result path. Failed or blocked edits
+      // are common, and leaving their entry behind would grow this module-global
+      // map for the lifetime of the session.
+      const resultPath = (event.input as { path?: string } | undefined)?.path;
+      const resultKey =
+        resultPath && event.toolCallId ? `${event.toolCallId}:${resultPath}` : undefined;
+      const before = resultKey ? pendingBeforeDiags.get(resultKey) : undefined;
+      if (resultKey) pendingBeforeDiags.delete(resultKey);
+
+      if (event.toolName !== "edit" && event.toolName !== "write") return;
+
+      const enabled = pi.getFlag("auto-diag");
+      if (!enabled) return;
+
+      if (event.isError) {
+        recordAutoDiagOutcome(pi, "edit_failed");
+        return;
+      }
+
+      const filePath = resultPath;
+      if (!filePath) return;
+
+      const state = getState();
+      if (!state) return;
+
+      // No baseline was captured (no live client for this file yet), so we
+      // cannot tell pre-existing errors from newly introduced ones. Stay silent
+      // rather than reporting the file's whole error set as "new".
+      if (before && before.diagnostics === null && before.failed) {
+        // Already counted as `baseline_failed` by the pre-edit hook. Counting it
+        // again here would push the outcome totals past the edit count, which is
+        // how a counter starts lying.
+        return;
+      }
+
+      if (!before || before.diagnostics === null) {
+        recordAutoDiagOutcome(pi, "no_baseline");
+        return;
+      }
+
+      // Run diagnostics + query code actions on post-mutation state. This throws
+      // only when the file has no live LSP client at all; a failed code-action
+      // lookup degrades to "no fix annotations" inside diagnosticsWithFixes, so
+      // it cannot be miscounted as missing coverage.
+      let afterResult: {
+        diagnostics: LspDiagnosticsResult;
+        diagnosticActions: Array<{ diagnosticIndex: number; actionTitles: string[] }>;
+      };
+      try {
+        afterResult = await state.runtimeManager.diagnosticsWithFixes(filePath);
+      } catch {
+        // LSP doesn't cover this file type — nothing to report.
+        recordAutoDiagOutcome(pi, "no_client");
+        return;
+      }
+
+      // The post-edit read waits for a publication matching the version it
+      // synced, bounded per server. Timing out here means the diff would be
+      // taken against a cache the server has not refreshed for this edit.
+      if (afterResult.diagnostics.published === false) {
+        recordAutoDiagOutcome(pi, "not_published");
+        return;
+      }
+
+      const rawAfter = afterResult.diagnostics.diagnostics;
+
+      // Sort both arrays identically so diagnosticActions indices align.
+      const sortedBefore = [...before.diagnostics].sort(sortDiags);
+      const sortedAfter = [...rawAfter].sort(sortDiags);
+
+      // Build a Set-key for each before-diagnostic for O(n) lookup.
+      const beforeKeys = new Set(
+        sortedBefore.map(
+          (d) => `${d.range.start.line}:${d.range.start.character}:${d.message}:${d.code ?? ""}`,
+        ),
+      );
+
+      // Collect new Error-severity diagnostics (DiagnosticSeverity.Error === 1).
+      type DaEntry = { diagnosticIndex: number; actionTitles: string[] };
+      const diagActionMap = new Map<number, string[]>(
+        afterResult.diagnosticActions.map((da: DaEntry) => [da.diagnosticIndex, da.actionTitles]),
+      );
+
+      interface NewDiag {
+        d: Diagnostic;
+        sortedIndex: number;
+      }
+      const newErrors: NewDiag[] = [];
+      for (let i = 0; i < sortedAfter.length; i++) {
+        const d = sortedAfter[i];
+        if (d.severity !== 1) continue;
+        const key = `${d.range.start.line}:${d.range.start.character}:${d.message}:${d.code ?? ""}`;
+        if (beforeKeys.has(key)) continue;
+        newErrors.push({ d, sortedIndex: i });
+      }
+
+      if (newErrors.length === 0) {
+        recordAutoDiagOutcome(pi, "no_new_errors");
+        return;
+      }
+
+      // Build steer message.
+      const lines: string[] = [];
+      let fixableCount = 0;
+
+      for (let i = 0; i < newErrors.length && i < 5; i++) {
+        const { d, sortedIndex } = newErrors[i];
+        const fixTitles = diagActionMap.get(sortedIndex);
+        const hasFix = fixTitles && fixTitles.length > 0;
+        if (hasFix) fixableCount++;
+        const fixSuffix = hasFix
+          ? ` [Fix: "${fixTitles![0]}"]`
+          : "";
+        const codeStr = d.code ? ` (${d.code})` : "";
+        lines.push(`  L${d.range.start.line + 1}${codeStr} ${d.message}${fixSuffix}`);
+      }
+
+      const overflow =
+        newErrors.length > 5
+          ? `\n  ... and ${newErrors.length - 5} more`
+          : "";
+
+      const fixHint =
+        fixableCount > 0
+          ? ` (${fixableCount} fixable)`
+          : "";
+
+      const body =
+        `[auto-diag] ${filePath}: ${newErrors.length} new error(s)${fixHint}\n` +
+        lines.join("\n") +
+        overflow +
+        "\n" +
+        `Use \`lsp_code_action\` with \`apply\` to apply an available fix.`;
+
+      pi.sendMessage(
+        {
+          customType: "auto_diag",
+          content: body,
+          display: false,  // invisible in UI; still written to session file
+                            // but skipped on session restore (see session-manager.ts)
+        },
+        { deliverAs: "steer" },
+      );
+
+      recordAutoDiagOutcome(pi, "emitted");
     } catch {
-      // LSP doesn't cover this file type — nothing to report.
-      recordAutoDiagOutcome(pi, "no_client");
-      return;
+      // A diagnostics comparison failure must not resurface as a tool error
+      // and hide the write that actually succeeded.
+      recordAutoDiagOutcome(pi, "post_edit_failed");
     }
-
-    // The post-edit read waits for a publication matching the version it
-    // synced, bounded per server. Timing out here means the diff would be
-    // taken against a cache the server has not refreshed for this edit.
-    if (afterResult.diagnostics.published === false) {
-      recordAutoDiagOutcome(pi, "not_published");
-      return;
-    }
-
-    const rawAfter = afterResult.diagnostics.diagnostics;
-
-    // Sort both arrays identically so diagnosticActions indices align.
-    const sortedBefore = [...before.diagnostics].sort(sortDiags);
-    const sortedAfter = [...rawAfter].sort(sortDiags);
-
-    // Build a Set-key for each before-diagnostic for O(n) lookup.
-    const beforeKeys = new Set(
-      sortedBefore.map(
-        (d) => `${d.range.start.line}:${d.range.start.character}:${d.message}:${d.code ?? ""}`,
-      ),
-    );
-
-    // Collect new Error-severity diagnostics (DiagnosticSeverity.Error === 1).
-    type DaEntry = { diagnosticIndex: number; actionTitles: string[] };
-    const diagActionMap = new Map<number, string[]>(
-      afterResult.diagnosticActions.map((da: DaEntry) => [da.diagnosticIndex, da.actionTitles]),
-    );
-
-    interface NewDiag {
-      d: Diagnostic;
-      sortedIndex: number;
-    }
-    const newErrors: NewDiag[] = [];
-    for (let i = 0; i < sortedAfter.length; i++) {
-      const d = sortedAfter[i];
-      if (d.severity !== 1) continue;
-      const key = `${d.range.start.line}:${d.range.start.character}:${d.message}:${d.code ?? ""}`;
-      if (beforeKeys.has(key)) continue;
-      newErrors.push({ d, sortedIndex: i });
-    }
-
-    if (newErrors.length === 0) {
-      recordAutoDiagOutcome(pi, "no_new_errors");
-      return;
-    }
-
-    // Build steer message.
-    const lines: string[] = [];
-    let fixableCount = 0;
-
-    for (let i = 0; i < newErrors.length && i < 5; i++) {
-      const { d, sortedIndex } = newErrors[i];
-      const fixTitles = diagActionMap.get(sortedIndex);
-      const hasFix = fixTitles && fixTitles.length > 0;
-      if (hasFix) fixableCount++;
-      const fixSuffix = hasFix
-        ? ` [Fix: "${fixTitles![0]}"]`
-        : "";
-      const codeStr = d.code ? ` (${d.code})` : "";
-      lines.push(`  L${d.range.start.line + 1}${codeStr} ${d.message}${fixSuffix}`);
-    }
-
-    const overflow =
-      newErrors.length > 5
-        ? `\n  ... and ${newErrors.length - 5} more`
-        : "";
-
-    const fixHint =
-      fixableCount > 0
-        ? ` (${fixableCount} fixable)`
-        : "";
-
-    const body =
-      `[auto-diag] ${filePath}: ${newErrors.length} new error(s)${fixHint}\n` +
-      lines.join("\n") +
-      overflow +
-      "\n" +
-      `Use \`lsp_code_action\` with \`apply\` to apply an available fix.`;
-
-    pi.sendMessage(
-      {
-        customType: "auto_diag",
-        content: body,
-        display: false,  // invisible in UI; still written to session file
-                          // but skipped on session restore (see session-manager.ts)
-      },
-      { deliverAs: "steer" },
-    );
-
-    recordAutoDiagOutcome(pi, "emitted");
   });
 
   // Persist the counters when the session ends so the outcome mix is recorded

@@ -24,10 +24,7 @@ interface Harness {
   getFlag: () => boolean;
 }
 
-function setup(
-  state: LspExtensionState | null,
-  { autoDiag = true }: { autoDiag?: boolean } = {},
-): Harness {
+function setup(state: LspExtensionState | null, { autoDiag = true }: { autoDiag?: boolean } = {}): Harness {
   const handlers = new Map<string, Handler>();
   const sendMessage = vi.fn();
   const appendEntry = vi.fn();
@@ -61,6 +58,8 @@ function fakeState(options: {
       installMode: "auto",
       warmup: false,
       extraWorkspaceRoots: [],
+      autoWorkspaceRoots: [],
+      autoWorkspaceRootMode: "trusted",
     },
     installManager: {} as never,
     processRegistry: {} as never,
@@ -74,14 +73,12 @@ function fakeState(options: {
           codeActions: null,
           diagnosticActions: [],
         })),
-      diagnostics:
-        options.diagnostics ?? (async () => ({ diagnostics: [], published: true })),
+      diagnostics: options.diagnostics ?? (async () => ({ diagnostics: [], published: true })),
     } as never,
   };
 }
 
-const editCall = (id: string, path: string) =>
-  ({ toolName: "edit", toolCallId: id, input: { path } }) as never;
+const editCall = (id: string, path: string) => ({ toolName: "edit", toolCallId: id, input: { path } }) as never;
 
 const editResult = (id: string, path: string) =>
   ({ toolName: "edit", toolCallId: id, input: { path }, isError: false }) as never;
@@ -145,7 +142,9 @@ describe("auto-diag baseline handling", () => {
     // and report every existing error as newly introduced.
     const state = fakeState({
       cachedDiagnostics: () => undefined,
-      diagnostics: async () => { throw new Error("no server"); },
+      diagnostics: async () => {
+        throw new Error("no server");
+      },
       diagnosticsWithFixes: async () => ({
         diagnostics: { diagnostics: [diag(3, "pre-existing error")] },
         codeActions: null,
@@ -312,14 +311,20 @@ describe("auto-diag baseline handling", () => {
     await handlers.get("tool_call")!(editCall("c7", "/repo/g.py"));
 
     await handlers.get("tool_result")!({
-      toolName: "edit", toolCallId: "c7", input: { path: "/repo/g.py" }, isError: true,
+      toolName: "edit",
+      toolCallId: "c7",
+      input: { path: "/repo/g.py" },
+      isError: true,
     } as never);
     expect(sendMessage).not.toHaveBeenCalled();
 
     // The baseline must be gone, so this result has no baseline and stays
     // silent instead of reporting the pre-existing error as new.
     await handlers.get("tool_result")!({
-      toolName: "edit", toolCallId: "c7", input: { path: "/repo/g.py" }, isError: false,
+      toolName: "edit",
+      toolCallId: "c7",
+      input: { path: "/repo/g.py" },
+      isError: false,
     } as never);
 
     expect(sendMessage).not.toHaveBeenCalled();
@@ -336,10 +341,15 @@ describe("auto-diag baseline handling", () => {
     const { handlers, sendMessage } = setup(state);
 
     await handlers.get("tool_call")!({
-      toolName: "write", toolCallId: "w1", input: { path: "/repo/new.py" },
+      toolName: "write",
+      toolCallId: "w1",
+      input: { path: "/repo/new.py" },
     } as never);
     await handlers.get("tool_result")!({
-      toolName: "write", toolCallId: "w1", input: { path: "/repo/new.py" }, isError: false,
+      toolName: "write",
+      toolCallId: "w1",
+      input: { path: "/repo/new.py" },
+      isError: false,
     } as never);
 
     expect(autoDiagBody(sendMessage)).toContain("1 new error");
@@ -351,7 +361,9 @@ describe("auto-diag baseline handling", () => {
 
     await expect(
       handlers.get("tool_result")!({
-        toolName: "edit", toolCallId: "n1", isError: false,
+        toolName: "edit",
+        toolCallId: "n1",
+        isError: false,
       } as never) as Promise<unknown>,
     ).resolves.toBeUndefined();
     expect(sendMessage).not.toHaveBeenCalled();
@@ -439,14 +451,25 @@ describe("auto-diag outcome counters", () => {
     await handlers.get("tool_result")!(editResult("c9", "/repo/clean.py"));
     expect(delta(before).no_new_errors).toBe(1);
 
+    // A snapshot that throws is a failure, not an absence, and counting it as
+    // one is what makes a broken path look like a quiet file.
     const noBaseline = fakeState({
       cachedDiagnostics: () => undefined,
-      diagnostics: async () => { throw new Error("no server"); },
+      diagnostics: async () => {
+        throw new Error("no server");
+      },
     });
     const second = setup(noBaseline);
     await second.handlers.get("tool_call")!(editCall("n9", "/repo/nb.py"));
     await second.handlers.get("tool_result")!(editResult("n9", "/repo/nb.py"));
-    expect(delta(before).no_baseline).toBe(1);
+    expect(delta(before).baseline_failed).toBe(1);
+    expect(delta(before).no_baseline).toBe(0);
+
+    // No pre-edit snapshot at all (no hook ran for this call) is the absence.
+    const orphan = setup(clean);
+    const beforeThird = getAutoDiagStats();
+    await orphan.handlers.get("tool_result")!(editResult("orphan", "/repo/orphan.py"));
+    expect(getAutoDiagStats().no_baseline - beforeThird.no_baseline).toBe(1);
 
     const steers = fakeState({
       cachedDiagnostics: () => [],
@@ -478,6 +501,94 @@ describe("auto-diag outcome counters", () => {
     expect(delta(before).edit_failed).toBe(0);
   });
 
+  it("never lets an LSP failure reach the edit tool", async () => {
+    // This handler runs in front of every edit and write. An exception that
+    // escapes a tool_call handler fails the tool call, so an out-of-scope path
+    // once made a file unwritable. Both LSP entry points throw here, which is
+    // the worst case the guard has to survive.
+    const state = fakeState({
+      cachedDiagnostics: () => {
+        throw new Error("boom in cachedDiagnostics");
+      },
+      diagnostics: async () => {
+        throw new Error("boom in diagnostics");
+      },
+      diagnosticsWithFixes: async () => {
+        throw new Error("boom in diagnosticsWithFixes");
+      },
+    });
+    const { handlers } = setup(state);
+    const before = getAutoDiagStats();
+
+    await expect(handlers.get("tool_call")!(editCall("boom", "/repo/boom.py"))).resolves.toBeUndefined();
+    await expect(handlers.get("tool_result")!(editResult("boom", "/repo/boom.py"))).resolves.toBeUndefined();
+
+    // Counted, not silent: a swallowed failure that is also invisible is how a
+    // broken snapshot path looks like a healthy one.
+    expect(getAutoDiagStats().baseline_failed - before.baseline_failed).toBe(1);
+  });
+
+  it("survives a throwing diagnostics read after the edit", async () => {
+    const state = fakeState({
+      cachedDiagnostics: () => [],
+      diagnosticsWithFixes: async () => {
+        throw new Error("boom after the write");
+      },
+    });
+    const { handlers } = setup(state);
+    const before = getAutoDiagStats();
+
+    await handlers.get("tool_call")!(editCall("post", "/repo/post.py"));
+    await expect(handlers.get("tool_result")!(editResult("post", "/repo/post.py"))).resolves.toBeUndefined();
+
+    expect(getAutoDiagStats().no_client - before.no_client).toBe(1);
+  });
+
+  it("survives a failing steer delivery", async () => {
+    // pi.sendMessage sits on the success path of the comparison. If it throws,
+    // the write already happened and must not be reported as a failure.
+    const state = fakeState({
+      cachedDiagnostics: () => [],
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [{ message: "new error", severity: 1 }], published: true },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+    sendMessage.mockImplementation(() => {
+      throw new Error("boom while steering");
+    });
+    const before = getAutoDiagStats();
+
+    await handlers.get("tool_call")!(editCall("steer", "/repo/steer.py"));
+    await expect(handlers.get("tool_result")!(editResult("steer", "/repo/steer.py"))).resolves.toBeUndefined();
+
+    expect(getAutoDiagStats().post_edit_failed - before.post_edit_failed).toBe(1);
+  });
+
+  it("survives a throwing appendEntry from inside the failure path", async () => {
+    // The counters are reached from the hooks' own catch blocks. appendEntry is
+    // synchronous file I/O and can throw, and an exception escaping a
+    // tool_call handler fails that tool call - so the outage would have moved
+    // into its own failure path and stayed there.
+    const state = fakeState({
+      cachedDiagnostics: () => {
+        throw new Error("boom in cachedDiagnostics");
+      },
+    });
+    const { handlers, appendEntry } = setup(state);
+    appendEntry.mockImplementation(() => {
+      throw new Error("EACCES");
+    });
+
+    await expect(handlers.get("tool_call")!(editCall("io", "/repo/io.py"))).resolves.toBeUndefined();
+    await expect(handlers.get("tool_result")!(editResult("io", "/repo/io.py"))).resolves.toBeUndefined();
+
+    // The batch stays pending rather than being silently zeroed.
+    expect(getAutoDiagStats().unflushed).toBeGreaterThan(0);
+  });
+
   it("persists counters to the session on shutdown, without model delivery", async () => {
     const state = fakeState({
       cachedDiagnostics: () => [],
@@ -488,6 +599,11 @@ describe("auto-diag outcome counters", () => {
       }),
     });
     const { handlers, appendEntry } = setup(state);
+    // Counters are process-scoped, so this test's "nothing flushed yet" claim
+    // depends on the totals left behind by earlier cases. Reset first: a new
+    // counted outcome can otherwise push the running total to the cadence
+    // threshold mid-test and fail an assertion about cadence.
+    await handlers.get("session_start")!({ type: "session_start" } as never);
     const before = getAutoDiagStats();
 
     await handlers.get("tool_call")!(editCall("sd", "/repo/sd.py"));
