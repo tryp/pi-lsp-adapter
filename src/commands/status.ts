@@ -17,6 +17,22 @@ export interface LspStatusSnapshot {
   workspaceScopeStats?: ReturnType<typeof getWorkspaceScopeStats>;
 }
 
+/**
+ * Cause labels for the `baseline_failed` breakdown, in the order worth reading:
+ * the actionable causes first, the catch-all last.
+ */
+const BASELINE_FAILURE_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ["baseline_failed_no_server", "no server for the filetype"],
+  ["baseline_failed_not_installed", "server binary not installed"],
+  ["baseline_failed_start_failed", "server failed to start"],
+  ["baseline_failed_outside_workspace", "file outside every workspace root"],
+  ["baseline_failed_no_filetype", "no filetype detected"],
+  ["baseline_failed_read_error", "file could not be read"],
+  ["baseline_failed_path_error", "path was refused"],
+  ["baseline_failed_no_client", "no usable client"],
+  ["baseline_failed_unknown", "unrecognized error"],
+];
+
 export function formatLspStatus(snapshot: LspStatusSnapshot): string {
   const lines = ["LSP status", ""];
   lines.push(`installMode: ${snapshot.config.installMode}`);
@@ -55,6 +71,21 @@ export function formatLspStatus(snapshot: LspStatusSnapshot): string {
     );
     lines.push(`- no client for file: ${stats.no_client}`);
     lines.push(`- failed edits: ${stats.edit_failed}`);
+    // The largest outcome on the measured corpus is not printed anywhere, and
+    // it is the one an operator asking "why is my steer rate low?" needs: one
+    // edit in five loses its baseline, and the cause says which fix to make.
+    lines.push(
+      `- baseline failed: ${stats.baseline_failed} (${((100 * stats.baseline_failed) / stats.edits).toFixed(1)}% of edits)`,
+    );
+    const causes = BASELINE_FAILURE_LABELS.filter(
+      ([key]) => (stats as unknown as Record<string, number>)[key] > 0,
+    );
+    if (causes.length > 0) {
+      for (const [key, label] of causes) {
+        const count = (stats as unknown as Record<string, number>)[key];
+        lines.push(`    ${label}: ${count}`);
+      }
+    }
   }
 
   const scope = snapshot.workspaceScopeStats;

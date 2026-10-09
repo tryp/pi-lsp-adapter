@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { getAutoDiagStats, registerLspTools } from "../../src/tools/registerLspTools.js";
+import {
+  getAutoDiagBaselineServerRoots,
+  getAutoDiagStats,
+  registerLspTools,
+} from "../../src/tools/registerLspTools.js";
 import type { LspExtensionState } from "../../src/state.js";
 
 /**
@@ -25,6 +29,7 @@ interface Harness {
 }
 
 function setup(state: LspExtensionState | null, { autoDiag = true }: { autoDiag?: boolean } = {}): Harness {
+
   const handlers = new Map<string, Handler>();
   const sendMessage = vi.fn();
   const appendEntry = vi.fn();
@@ -41,6 +46,9 @@ function setup(state: LspExtensionState | null, { autoDiag = true }: { autoDiag?
     appendEntry,
   };
   registerLspTools(api as never, () => state);
+  // The counters are module-global, so a test that does not start from zero
+  // reads the previous test's edits. `session_start` is the reset the runtime
+  // performs on /new and /resume; firing it here makes each case start clean.
   return { handlers, sendMessage, appendEntry, getFlag: () => autoDiag };
 }
 
@@ -556,6 +564,7 @@ describe("auto-diag outcome counters", () => {
       }),
     });
     const { handlers, sendMessage } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
     sendMessage.mockImplementation(() => {
       throw new Error("boom while steering");
     });
@@ -644,3 +653,188 @@ describe("auto-diag outcome counters", () => {
     expect(payload.edits - before.edits).toBe(20);
   });
 });
+
+
+// ── Baseline failure causes ───────────────────────────────────────────
+//
+// One edit in five ends in `baseline_failed` on the measured corpus, and a
+// single counter cannot say which fix to make: a client that never started, a
+// server whose binary is missing, a file outside every workspace root, and a
+// path the resolver rejected call for four different responses.
+
+class FakeLspRuntimeError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message);
+    this.name = "LspRuntimeError";
+  }
+}
+
+describe("baseline failure causes", () => {
+  const throwing = (error: unknown): (() => Promise<unknown>) => async () => {
+    throw error;
+  };
+
+  const cases: Array<[string, unknown, string]> = [
+    ["a file no configured server handles",
+      new FakeLspRuntimeError("No configured LSP server handles filetype x", "no-server"),
+      "baseline_failed_no_server"],
+    ["a filetype nothing detects", new FakeLspRuntimeError("No LSP filetype", "no-filetype"),
+      "baseline_failed_no_filetype"],
+    ["a server binary that is not installed",
+      new FakeLspRuntimeError("not installed", "not-installed"),
+      "baseline_failed_not_installed"],
+    ["a server that failed to start", new FakeLspRuntimeError("start failed", "start-failed"),
+      "baseline_failed_start_failed"],
+    ["a file outside every workspace root",
+      new FakeLspRuntimeError("outside", "outside-workspace"),
+      "baseline_failed_outside_workspace"],
+    ["a file that cannot be read", Object.assign(new Error("ENOENT"), { code: "ENOENT" }),
+      "baseline_failed_read_error"],
+    ["an unrecognized error", new Error("boom"), "baseline_failed_unknown"],
+  ];
+
+  for (const [label, error, expected] of cases) {
+    it(`attributes ${label} to ${expected}`, async () => {
+      const state = fakeState({
+        cachedDiagnostics: () => undefined,
+        diagnostics: throwing(error),
+      });
+      const { handlers } = setup(state);
+      await handlers.get("session_start")!(undefined as never);
+      // 20 edits reach the periodic flush, which is how the counters become
+      // observable in the session log.
+      for (let i = 0; i < 20; i++) {
+        await handlers.get("tool_call")!(editCall(`t${i}`, `/repo/f${i}.py`));
+      }
+      const stats = getAutoDiagStats();
+      expect(stats.baseline_failed).toBe(20);
+      expect(
+        (stats as unknown as Record<string, number>)[expected],
+      ).toBe(20);
+    });
+  }
+
+  it("keeps the cause counters summing to the total", async () => {
+    // A cause counter that drifts from the total makes the breakdown a fiction
+    // with more plausible-looking precision than the number it came from.
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: throwing(new FakeLspRuntimeError("No configured LSP server", "no-server")),
+    });
+    const { handlers } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+    for (let i = 0; i < 20; i++) {
+      await handlers.get("tool_call")!(editCall(`t${i}`, `/repo/f${i}.py`));
+    }
+    const stats = getAutoDiagStats() as unknown as Record<string, number>;
+    const causes = Object.keys(stats)
+      .filter((key) => key.startsWith("baseline_failed_"))
+      .reduce((sum, key) => sum + stats[key], 0);
+    expect(causes).toBe(stats.baseline_failed);
+  });
+
+  it("counts one outcome per edit, not one per hook", async () => {
+    // The post-edit hook must not re-count a baseline the pre-edit hook
+    // already charged: that is how a counter starts lying.
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: throwing(new FakeLspRuntimeError("outside", "outside-workspace")),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(3, "pre-existing error")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+    await handlers.get("tool_call")!(editCall("once", "/repo/x.py"));
+    await handlers.get("tool_result")!(editResult("once", "/repo/x.py"));
+    const stats = getAutoDiagStats();
+    expect(stats.baseline_failed).toBe(1);
+    expect(stats.no_baseline).toBe(0);
+    expect(stats.edits).toBe(1);
+  });
+
+  it("records which server and root produced a baseline", async () => {
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: async () => ({
+        diagnostics: [],
+        published: true,
+        serverId: "vtsls",
+        rootDir: "/repo",
+      }),
+    });
+    const { handlers, appendEntry } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+    // Both hooks per edit: the tally rides on a flush an *outcome* triggers, so
+    // a run that only snapshots baselines never reaches the session log.
+    for (let i = 0; i < 20; i++) {
+      await handlers.get("tool_call")!(editCall(`s${i}`, `/repo/y${i}.py`));
+      await handlers.get("tool_result")!(editResult(`s${i}`, `/repo/y${i}.py`));
+    }
+    expect(getAutoDiagBaselineServerRoots()["vtsls|/repo"]).toBe(20);
+    // appendEntry(type, data): the payload is the second argument.
+    const payload = appendEntry.mock.calls.at(-1)?.[1] as
+      | { baseline_server_root?: Record<string, number> }
+      | undefined;
+    expect(payload?.baseline_server_root?.["vtsls|/repo"]).toBe(20);
+  });
+
+  it("resets the per-server tally with the rest", async () => {
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: async () => ({
+        diagnostics: [], published: true, serverId: "vtsls", rootDir: "/repo",
+      }),
+    });
+    const { handlers } = setup(state);
+    await handlers.get("tool_call")!(editCall("srv", "/repo/x.py"));
+    // A `/new` zeroes the counters; if the per-server tally survived it, the
+    // next session would report the previous session's edits against itself.
+    await handlers.get("session_start")!(undefined as never);
+    expect(getAutoDiagBaselineServerRoots()["vtsls|/repo"]).toBeUndefined();
+    expect(getAutoDiagStats().edits).toBe(0);
+  });
+});
+
+// ── The post-edit guard ───────────────────────────────────────────────
+
+describe("post_edit_failed is reachable and observable", () => {
+  it("counts a throw from the comparison without failing the tool", async () => {
+    // `post_edit_failed` reads 0 across the whole corpus, which is only worth
+    // anything if the path it counts is exercised. A `sendMessage` throw is the
+    // realistic shape: the write already succeeded, so the failure must not
+    // resurface as a tool error.
+    const state = fakeState({
+      cachedDiagnostics: () => [{ severity: 1, message: "old", range: r() }] as never,
+      diagnostics: async () => ({ diagnostics: [], published: true }),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(3, "new")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+    sendMessage.mockImplementation(() => {
+      throw new Error("delivery failed");
+    });
+
+    await expect(
+      handlers.get("tool_call")!(editCall("post", "/repo/x.py")),
+    ).resolves.toBeUndefined();
+    await expect(
+      handlers.get("tool_result")!(editResult("post", "/repo/x.py")),
+    ).resolves.toBeUndefined();
+
+    expect(getAutoDiagStats().post_edit_failed).toBe(1);
+    expect(getAutoDiagStats().emitted).toBe(0);
+  });
+});
+
+function r() {
+  return { start: { line: 1, character: 0 }, end: { line: 1, character: 2 } };
+}

@@ -8,6 +8,13 @@ import type { Diagnostic } from "vscode-languageserver-types";
 import type { LspExtensionState } from "../state.js";
 import { setLspStatusLine } from "../statusLine.js";
 import type { LspDiagnosticsResult } from "../lsp/client.js";
+// Type-only on purpose. A runtime import here would pull the whole LSP client
+// graph into every module that touches auto-diag, and that graph does not load
+// under a strict resolver in this checkout: src/lsp/client.ts imports a symbol
+// the pinned vscode-languageserver-protocol does not export. The class is used
+// for its type and its documented `.code`; the runtime check is structural so
+// no new module edge is created.
+import type { LspRuntimeError } from "../lsp/runtimeManager.js";
 import {
   failure,
   success,
@@ -69,7 +76,38 @@ type AutoDiagOutcome =
    * snapshot path could look like a healthy one that simply had nothing to
    * compare against.
    */
-  | "baseline_failed";
+  | "baseline_failed"
+  /**
+   * Cause breakdown for `baseline_failed`.
+   *
+   * One edit in five ends here on the measured corpus, and a single counter
+   * cannot say which fix to make: a client that never started, a server whose
+   * binary is missing, a file outside every workspace root, and a path the
+   * resolver rejected are four different remediations. The codes mirror
+   * `LspRuntimeError.code`, so the classification is the runtime's own and not
+   * a second opinion.
+   */
+  | "baseline_failed_no_client"
+  | "baseline_failed_no_filetype"
+  | "baseline_failed_no_server"
+  | "baseline_failed_not_installed"
+  | "baseline_failed_start_failed"
+  | "baseline_failed_outside_workspace"
+  | "baseline_failed_path_error"
+  | "baseline_failed_read_error"
+  | "baseline_failed_unknown";
+
+/** How a `baseline_failed` was attributed. */
+export type BaselineFailureCause =
+  | "no_client"
+  | "no_filetype"
+  | "no_server"
+  | "not_installed"
+  | "start_failed"
+  | "outside_workspace"
+  | "path_error"
+  | "read_error"
+  | "unknown";
 
 const autoDiagStats = {
   edits: 0,
@@ -81,9 +119,34 @@ const autoDiagStats = {
   edit_failed: 0,
   baseline_failed: 0,
   post_edit_failed: 0,
+  baseline_failed_no_client: 0,
+  baseline_failed_no_filetype: 0,
+  baseline_failed_no_server: 0,
+  baseline_failed_not_installed: 0,
+  baseline_failed_start_failed: 0,
+  baseline_failed_outside_workspace: 0,
+  baseline_failed_path_error: 0,
+  baseline_failed_read_error: 0,
+  baseline_failed_unknown: 0,
   /** Edits handled since the last persisted snapshot. */
   unflushed: 0,
 } satisfies Record<AutoDiagOutcome | "edits" | "unflushed", number>;
+
+/**
+ * Which server and root directory produced a baseline, counted per edit.
+ *
+ * Keys are `<serverId>|<rootDir>`. A failure cause is far less actionable
+ * without knowing *where* it happens: `start_failed` for vtsls at a task
+ * checkout and `not_installed` for ruff-lsp at the same root call for
+ * different responses.
+ *
+ * Recorded once per edit, where the baseline is established. A baseline served
+ * from the client's own publication cache (`cachedDiagnostics`) does not name a
+ * server, so cache hits are absent from these totals -- they are reads that
+ * succeeded without the runtime, and accounting for them would need the
+ * cache to carry the owning server on every entry.
+ */
+const baselineServerRoot: Record<string, number> = {};
 
 /** Persist every N edits, so a killed session still leaves usable evidence. */
 const AUTO_DIAG_STATS_FLUSH_EVERY = 20;
@@ -91,6 +154,11 @@ const AUTO_DIAG_STATS_FLUSH_EVERY = 20;
 /** Current counters, for `/lsp status` and tests. */
 export function getAutoDiagStats() {
   return { ...autoDiagStats };
+}
+
+/** Expose the per-server baseline tally for `/lsp status` and tests. */
+export function getAutoDiagBaselineServerRoots() {
+  return { ...baselineServerRoot };
 }
 
 /**
@@ -102,6 +170,9 @@ export function getAutoDiagStats() {
 function resetAutoDiagStats(): void {
   for (const key of Object.keys(autoDiagStats) as Array<keyof typeof autoDiagStats>) {
     autoDiagStats[key] = 0;
+  }
+  for (const key of Object.keys(baselineServerRoot)) {
+    delete baselineServerRoot[key];
   }
 }
 
@@ -124,6 +195,66 @@ function recordAutoDiagOutcome(
   }
 }
 
+/**
+ * Classify why a baseline could not be taken.
+ *
+ * `LspRuntimeError.code` carries the runtime's own answer, and it is the only
+ * classification here -- re-deriving it would give the counter a second
+ * opinion that could disagree with the code path that actually failed. Anything
+ * without a recognized code is `unknown` rather than folded into a
+ * plausible-looking cause.
+ *
+ * The shape check is structural rather than `instanceof` so that this module
+ * gains no runtime dependency on the LSP client graph; see the import above.
+ */
+function baselineFailureCause(error: unknown): BaselineFailureCause {
+  const runtimeError = error as Partial<LspRuntimeError> | null;
+  if (
+    runtimeError &&
+    runtimeError.name === "LspRuntimeError" &&
+    typeof runtimeError.code === "string"
+  ) {
+    switch (runtimeError.code) {
+      case "no-filetype":
+        return "no_filetype";
+      case "no-server":
+        return "no_server";
+      case "not-installed":
+        return "not_installed";
+      case "start-failed":
+        return "start_failed";
+      case "outside-workspace":
+        return "outside_workspace";
+      default:
+        return "path_error";
+    }
+  }
+  if (error instanceof Error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "EACCES" || code === "EISDIR") {
+      return "read_error";
+    }
+  }
+  return "unknown";
+}
+
+/** Record a baseline failure, keeping the total and its cause in step. */
+function recordBaselineFailed(pi: ExtensionAPI, error: unknown): void {
+  autoDiagStats.baseline_failed += 1;
+  autoDiagStats[`baseline_failed_${baselineFailureCause(error)}`] += 1;
+  autoDiagStats.edits += 1;
+  autoDiagStats.unflushed += 1;
+  if (autoDiagStats.unflushed >= AUTO_DIAG_STATS_FLUSH_EVERY) {
+    flushAutoDiagStats(pi);
+  }
+}
+
+/** Record which server and root produced a baseline for this edit. */
+function recordBaselineServer(serverId: string, rootDir: string): void {
+  const key = `${serverId}|${rootDir}`;
+  baselineServerRoot[key] = (baselineServerRoot[key] ?? 0) + 1;
+}
+
 function flushAutoDiagStats(pi: ExtensionAPI): void {
   if (autoDiagStats.unflushed === 0) return;
   // Zero after the write, not before: appendEntry is the one call here that
@@ -135,7 +266,14 @@ function flushAutoDiagStats(pi: ExtensionAPI): void {
   // call: the outage this file exists to prevent would move into its own
   // failure path. Losing a stats batch is the right trade.
   try {
-    pi.appendEntry("auto_diag_stats", { ...autoDiagStats });
+    // The per-server breakdown rides along in the same entry: a counter that
+    // covers one edit in five is only actionable next to where it happened,
+    // and a second entry type would have to be correlated on sessions where
+    // both flushes were killed mid-window.
+    pi.appendEntry("auto_diag_stats", {
+      ...autoDiagStats,
+      baseline_server_root: { ...baselineServerRoot },
+    });
     autoDiagStats.unflushed = 0;
   } catch {
     // Leave the batch pending: the next flush, or shutdown, may succeed.
@@ -191,18 +329,19 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       // accurate pre-edit baseline for a file nothing has opened yet, and the
       // edit is allowed to wait for it.
       const result = await state.runtimeManager.diagnostics(filePath, "auto-diag-baseline");
+      recordBaselineServer(result.serverId, result.rootDir);
       // `diagnostics: []` means either "clean" or "nothing published yet".
       // Recording the latter as a baseline would blame every pre-existing
       // error on this edit, so require an actual publication.
       pendingBeforeDiags.set(cacheKey, {
         diagnostics: result.published ? result.diagnostics : null,
       });
-    } catch {
+    } catch (error) {
       // No usable baseline, and the reason is not "the file was clean". The
       // failure is carried on the entry so the post-edit hook does not also
       // count this edit as a `no_baseline` outcome: one edit, one outcome.
       pendingBeforeDiags.set(cacheKey, { diagnostics: null, failed: true });
-      recordAutoDiagOutcome(pi, "baseline_failed");
+      recordBaselineFailed(pi, error);
     }
   });
 

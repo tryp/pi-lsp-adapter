@@ -50,12 +50,28 @@ describe("formatLspStatus auto-diag block", () => {
           edit_failed: 2,
           baseline_failed: 3,
           post_edit_failed: 1,
+          baseline_failed_no_server: 2,
+          baseline_failed_no_filetype: 0,
+          baseline_failed_not_installed: 0,
+          baseline_failed_start_failed: 0,
+          baseline_failed_outside_workspace: 1,
+          baseline_failed_path_error: 0,
+          baseline_failed_read_error: 0,
+          baseline_failed_no_client: 0,
+          baseline_failed_unknown: 0,
           unflushed: 7,
         },
       }),
     );
 
     expect(text).toContain("auto-diag outcomes:");
+    // The largest outcome on the real corpus was not printed at all, which is
+    // why a low steer rate looked unexplainable from /lsp status.
+    expect(text).toContain("- baseline failed: 3 (3.0% of edits)");
+    expect(text).toContain("no server for the filetype: 2");
+    expect(text).toContain("file outside every workspace root: 1");
+    expect(text).not.toContain("server binary not installed:");
+
     expect(text).toContain("- edits handled: 100");
     expect(text).toContain("- steers emitted: 40");
     expect(text).toContain("- not published in time: 30 (30.0% of edits)");
