@@ -838,3 +838,180 @@ describe("post_edit_failed is reachable and observable", () => {
 function r() {
   return { start: { line: 1, character: 0 }, end: { line: 1, character: 2 } };
 }
+
+
+// ── Outcome attribution ───────────────────────────────────────────────
+//
+// The pre-edit hook is the only place that knows *why* a baseline is unusable.
+// Charging the failure later, from the post-edit hook, collapses distinct
+// causes into one counter: "the server never published in time" used to be
+// recorded as `no_baseline`, which is 11.9% of edits on the measured corpus.
+
+describe("outcome attribution", () => {
+  it("charges an unpublished baseline to not_published at the point of failure", async () => {
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: async () => ({ diagnostics: [], published: false }),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(3, "pre-existing")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+
+    await handlers.get("tool_call")!(editCall("slow", "/repo/slow.py"));
+    await handlers.get("tool_result")!(editResult("slow", "/repo/slow.py"));
+
+    const stats = getAutoDiagStats();
+    expect(stats.not_published).toBe(1);
+    expect(stats.no_baseline).toBe(0);
+    expect(stats.edits).toBe(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("still treats a failed baseline read as its own outcome", async () => {
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: async () => {
+        throw new FakeLspRuntimeError("No configured LSP server", "no-server");
+      },
+    });
+    const { handlers } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+
+    await handlers.get("tool_call")!(editCall("err", "/repo/err.py"));
+    await handlers.get("tool_result")!(editResult("err", "/repo/err.py"));
+
+    const stats = getAutoDiagStats();
+    expect(stats.baseline_failed).toBe(1);
+    expect(stats.baseline_failed_no_server).toBe(1);
+    expect(stats.not_published).toBe(0);
+    expect(stats.no_baseline).toBe(0);
+  });
+
+  it("keeps every edit in exactly one outcome bucket", async () => {
+    // The invariant the whole counter set depends on: `edits` must equal the
+    // sum of outcomes, or the shares printed by /lsp status are fiction.
+    const state = fakeState({
+      cachedDiagnostics: () => undefined,
+      diagnostics: async () => ({ diagnostics: [], published: true }),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(5, "introduced")] },
+        codeActions: null,
+        diagnosticActions: [],
+      }),
+    });
+    const { handlers } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+    await handlers.get("tool_call")!(editCall("one", "/repo/one.py"));
+    await handlers.get("tool_result")!(editResult("one", "/repo/one.py"));
+
+    const stats = getAutoDiagStats() as unknown as Record<string, number>;
+    const outcomes = Object.keys(stats)
+      .filter((key) => key.startsWith("baseline_failed_") || [
+        "emitted", "no_baseline", "no_client", "not_published",
+        "no_new_errors", "edit_failed", "baseline_failed", "post_edit_failed",
+      ].includes(key))
+      .reduce((sum, key) => sum + stats[key], 0);
+    expect(outcomes).toBe(stats.edits);
+    expect(stats.emitted).toBe(1);
+  });
+});
+
+
+// ── Steer actionability ───────────────────────────────────────────────
+//
+// The footer named a tool the agent then had to construct arguments for, and
+// that path had a 0.2% take-up across the October deploys: 996 of 1000 steers
+// never reached lsp_code_action, while the surviving steers were larger
+// (mean claimed errors 3.68 -> 6.74) and acted on less (63.8% -> 56.8%). The
+// one handed-over-fix case is instead spelled out with the exact call.
+
+describe("steer actionability", () => {
+  const singleFixState = () =>
+    fakeState({
+      cachedDiagnostics: () => [],
+      diagnostics: async () => ({ diagnostics: [], published: true }),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(4, "unresolved-import")], published: true },
+        codeActions: null,
+        diagnosticActions: [{ diagnosticIndex: 0, actionTitles: ["Add import x from y"] }],
+      }),
+    });
+
+  it("names the exact lsp_code_action call for a single fixable error", async () => {
+    const state = singleFixState();
+    const { handlers, sendMessage } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+
+    await handlers.get("tool_call")!(editCall("one", "/repo/one.py"));
+    await handlers.get("tool_result")!(editResult("one", "/repo/one.py"));
+
+    const body = autoDiagBody(sendMessage) ?? "";
+    expect(body).toContain("Apply this one step:");
+    expect(body).toContain(
+      'lsp_code_action(filePath="/repo/one.py", position={line:4,character:0}, apply="Add import x from y")',
+    );
+  });
+
+  it("keeps the generic footer when the fix is not unambiguous", async () => {
+    // Two new errors: no single step to hand over, so the steer stays as it was
+    // rather than picking one of several fixes on the agent's behalf.
+    const state = fakeState({
+      cachedDiagnostics: () => [],
+      diagnostics: async () => ({ diagnostics: [], published: true }),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(4, "a"), diag(9, "b")], published: true },
+        codeActions: null,
+        diagnosticActions: [
+          { diagnosticIndex: 0, actionTitles: ["fix a"] },
+          { diagnosticIndex: 1, actionTitles: ["fix b"] },
+        ],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+
+    await handlers.get("tool_call")!(editCall("two", "/repo/two.py"));
+    await handlers.get("tool_result")!(editResult("two", "/repo/two.py"));
+
+    const body = autoDiagBody(sendMessage) ?? "";
+    expect(body).not.toContain("Apply this one step:");
+    expect(body).toContain("Use `lsp_code_action` with `apply`");
+  });
+
+  it("keeps the generic footer when one error offers several fixes", async () => {
+    const state = fakeState({
+      cachedDiagnostics: () => [],
+      diagnostics: async () => ({ diagnostics: [], published: true }),
+      diagnosticsWithFixes: async () => ({
+        diagnostics: { diagnostics: [diag(4, "ambiguous")], published: true },
+        codeActions: null,
+        diagnosticActions: [{ diagnosticIndex: 0, actionTitles: ["fix one", "fix two"] }],
+      }),
+    });
+    const { handlers, sendMessage } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+
+    await handlers.get("tool_call")!(editCall("amb", "/repo/amb.py"));
+    await handlers.get("tool_result")!(editResult("amb", "/repo/amb.py"));
+
+    expect(autoDiagBody(sendMessage) ?? "").not.toContain("Apply this one step:");
+  });
+
+  it("never applies a fix itself", async () => {
+    const state = singleFixState();
+    const { handlers, sendMessage } = setup(state);
+    await handlers.get("session_start")!(undefined as never);
+
+    await handlers.get("tool_call")!(editCall("noapply", "/repo/na.py"));
+    await handlers.get("tool_result")!(editResult("noapply", "/repo/na.py"));
+
+    // The steer is the only signal the agent gets; an edit it did not choose
+    // is one it does not expect, so applying is left to the agent.
+    const calls = sendMessage.mock.calls.length;
+    expect(calls).toBe(1);
+  });
+});

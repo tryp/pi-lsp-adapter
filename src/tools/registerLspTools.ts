@@ -333,9 +333,18 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
       // `diagnostics: []` means either "clean" or "nothing published yet".
       // Recording the latter as a baseline would blame every pre-existing
       // error on this edit, so require an actual publication.
-      pendingBeforeDiags.set(cacheKey, {
-        diagnostics: result.published ? result.diagnostics : null,
-      });
+      if (!result.published) {
+        // Charge it here, where the reason is known. This used to be recorded
+        // as `no_baseline` by the post-edit hook, because the entry carried
+        // `diagnostics: null` without `failed: true` -- so "the server never
+        // published in time" and "there was no baseline to take" were one
+        // counter. That bucket was 11.9% of edits in the measured corpus, and
+        // it is the population the per-server wait bound exists to explain.
+        pendingBeforeDiags.set(cacheKey, { diagnostics: null, failed: true });
+        recordAutoDiagOutcome(pi, "not_published");
+        return;
+      }
+      pendingBeforeDiags.set(cacheKey, { diagnostics: result.diagnostics });
     } catch (error) {
       // No usable baseline, and the reason is not "the file was clean". The
       // failure is carried on the entry so the post-edit hook does not also
@@ -479,10 +488,33 @@ function registerAutoDiag(pi: ExtensionAPI, getState: GetLspToolState): void {
           ? ` (${fixableCount} fixable)`
           : "";
 
+      // One error with one fix is the case worth spelling out. The generic
+      // footer below names a tool the agent must then construct arguments for,
+      // and on the measured corpus that path had a 0.2% take-up: 996 of 1000
+      // steers never reached lsp_code_action, while the surviving steers were
+      // larger and acted on less. Naming the call costs one line and removes
+      // the construction step.
+      //
+      // Deliberately not applying the fix here. An edit the agent did not choose
+      // is one it does not expect, and this steer is the only signal it gets.
+      let oneStep = "";
+      if (newErrors.length === 1 && fixableCount === 1) {
+        const { d, sortedIndex } = newErrors[0]!;
+        const titles = diagActionMap.get(sortedIndex);
+        if (titles && titles.length === 1 && titles[0]) {
+          oneStep =
+            `\nApply this one step:\n` +
+            `  lsp_code_action(filePath=${JSON.stringify(filePath)}, ` +
+            `position={line:${d.range.start.line},character:${d.range.start.character}}, ` +
+            `apply=${JSON.stringify(titles[0])})`;
+        }
+      }
+
       const body =
         `[auto-diag] ${filePath}: ${newErrors.length} new error(s)${fixHint}\n` +
         lines.join("\n") +
         overflow +
+        oneStep +
         "\n" +
         `Use \`lsp_code_action\` with \`apply\` to apply an available fix.`;
 

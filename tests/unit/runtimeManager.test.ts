@@ -941,3 +941,69 @@ function isDidOpenParams(value: unknown): value is { textDocument: { uri: string
     typeof value.textDocument.uri === "string"
   );
 }
+
+describe("root choice for a detected project outside the workspace", () => {
+  // Characterization, not a new feature. A suspicion that a worktree edit is
+  // rooted at the main checkout turned out to be wrong in mode=all: the
+  // out-of-scope *path* widening in resolvePath already adds the detected root
+  // and roots the client there. The root-mismatch complaints agents made are a
+  // policy outcome (trusted mode declining ~/.pi/worktree-checkouts), so the
+  // remedy is configuration, not this code path.
+  it("roots the client at the detected project in mode=all", async () => {
+    const worktree = join(tempDir, "worktrees", "task-one");
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "package.json"), "{}\n", "utf8");
+    await writeFile(join(worktree, "src", "index.ts"), "const x = 1;\n", "utf8");
+
+    const added: Array<{ root: string; filePath: string }> = [];
+    const runtime = runtimeManager({
+      autoWorkspaceRootMode: "all",
+      onAutoWorkspaceRoot: (info) => added.push(info),
+    });
+
+    const result = await runtime.diagnostics(join(worktree, "src", "index.ts"));
+
+    expect(result.rootDir).toBe(worktree);
+    expect(runtime.listWorkspaceRoots()).toContain(worktree);
+    expect(added).toEqual([
+      { root: worktree, filePath: join(worktree, "src", "index.ts") },
+    ]);
+  });
+
+  it("declines to widen a worktree under a trusted tree that does not contain it", async () => {
+    // The actual root-mismatch mechanism: in trusted mode a task checkout under
+    // ~/.pi/worktree-checkouts is not inside a trusted root (~/src), so the
+    // session refuses it and names the directory to add. That is a deliberate
+    // trust decision; the configuration remedy is to trust the holder.
+    const worktree = join(tempDir, "worktrees", "task-two");
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "package.json"), "{}\n", "utf8");
+    await writeFile(join(worktree, "src", "index.ts"), "const x = 1;\n", "utf8");
+
+    const runtime = runtimeManager({
+      autoWorkspaceRoots: [join(tempDir, "src")],
+      autoWorkspaceRootMode: "trusted",
+    });
+
+    await expect(
+      runtime.diagnostics(join(worktree, "src", "index.ts")),
+    ).rejects.toThrow("outside workspace");
+    expect(runtime.listWorkspaceRoots()).not.toContain(worktree);
+  });
+
+  it("adds a worktree whose trusted root contains it", async () => {
+    const trustedHolder = join(tempDir, "trusted");
+    const worktree = join(trustedHolder, "worktrees", "task-three");
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "package.json"), "{}\n", "utf8");
+    await writeFile(join(worktree, "src", "index.ts"), "const x = 1;\n", "utf8");
+
+    const runtime = runtimeManager({
+      autoWorkspaceRoots: [trustedHolder],
+      autoWorkspaceRootMode: "trusted",
+    });
+
+    const result = await runtime.diagnostics(join(worktree, "src", "index.ts"));
+    expect(result.rootDir).toBe(worktree);
+  });
+});
