@@ -21,6 +21,41 @@ import { LspResultCache } from "./tools/resultCache.js";
 import { setLspStatusLine } from "./statusLine.js";
 import type { LspExtensionState } from "./state.js";
 
+// Static, catalog-independent half of the appended prompt block.
+const LSP_GUIDANCE = `\n\n**EFFICIENCY RULES (follow strictly):**\n- To discover functions/classes/variables -> lsp_document_symbols (NOT read). After it, do NOT read for structure — the symbol tree is complete.\n- To check lint/type errors after editing -> lsp_diagnostics FIRST. Only read specific flagged lines.\n- To get type/signature/docs -> lsp_hover. Do NOT read surrounding block — hover returns the full type info.\n- To find definitions -> lsp_definition (NOT grep/read).\n- To assess rename impact -> lsp_references (NOT grep).\n- When lsp_diagnostics shows fixable errors -> lsp_code_action with apply=True to auto-fix.\n- For actual code body -> read specific line range (after lsp_document_symbols).\n\nWhen LSP result says "More available" with resultId, use lsp_more for next page. For hover/definition/references, put column on identifier. LSP uses 1-based line/col. Output is compact (file:line:col) — LSP calls survive compaction better than file reads.
+
+**Cross-project analysis:**
+- LSP tools are limited to project directory scopes.
+- Use lsp_add_workspace_root to add external directories into scope.
+- Use lsp_list_workspace_roots to see all directories in scope.`;
+
+// Catalog-derived half, empty until `session_start` has loaded the config: a
+// summary of servers that have not been read yet would be a guess, not a report.
+function serverSummary(state: LspExtensionState | null): string {
+  if (!state) return "";
+
+  const servers = state.config.catalog.servers;
+  const serverIds = Object.keys(servers);
+  if (serverIds.length === 0) return "";
+
+  const ftToExt: Record<string, string> = {
+    python: ".py", typescript: ".ts", typescriptreact: ".tsx",
+    javascript: ".js", javascriptreact: ".jsx",
+    go: ".go", rust: ".rs", java: ".java",
+    json: ".json", jsonc: ".jsonc", yaml: ".yaml/.yml",
+    markdown: ".md/.mdx",
+  };
+  const allFts = new Set<string>();
+  for (const id of serverIds) {
+    for (const ft of servers[id].filetypes) allFts.add(ft);
+  }
+  const extList = [...allFts].sort().map((ft) => ftToExt[ft] || ft).join(", ");
+  const serverList = serverIds
+    .map((id) => `${id}(${servers[id].filetypes.join(",")})`)
+    .join(", ");
+  return `\n\n**Available LSP servers (${serverIds.length}):** ${serverList}\nLSP tools work on: ${extList}. Call lsp_list_workspace_roots for full server details with display names.`;
+}
+
 export default function piAgentLspExtension(pi: ExtensionAPI): void {
   let state: LspExtensionState | null = null;
   let generation = 0;
@@ -31,38 +66,14 @@ export default function piAgentLspExtension(pi: ExtensionAPI): void {
   registerWorkspaceScopeStats(pi);
 
   pi.on("before_agent_start", (event) => {
-    if (!state) return;
-
-    // Build compact LSP server summary from the actual catalog
-    const servers = state.config.catalog.servers;
-    const serverIds = Object.keys(servers);
-    const ftToExt: Record<string, string> = {
-      python: ".py", typescript: ".ts", typescriptreact: ".tsx",
-      javascript: ".js", javascriptreact: ".jsx",
-      go: ".go", rust: ".rs", java: ".java",
-      json: ".json", jsonc: ".jsonc", yaml: ".yaml/.yml",
-      markdown: ".md/.mdx",
-    };
-    const allFts = new Set<string>();
-    for (const id of serverIds) {
-      for (const ft of servers[id].filetypes) allFts.add(ft);
-    }
-    const extList = [...allFts].sort().map((ft) => ftToExt[ft] || ft).join(", ");
-    const serverList = serverIds
-      .map((id) => `${id}(${servers[id].filetypes.join(",")})`)
-      .join(", ");
-
-    const serverBlock = serverIds.length > 0
-      ? `\n\n**Available LSP servers (${serverIds.length}):** ${serverList}\nLSP tools work on: ${extList}. Call lsp_list_workspace_roots for full server details with display names.`
-      : "";
-
+    // The guidance is static: nothing in it depends on the lifecycle state that
+    // `session_start` builds asynchronously. Appending it unconditionally matters
+    // because a first prompt can win the race against that async init, and the
+    // earlier `if (!state) return` then left the whole first epoch with no LSP
+    // instructions at all - silently, since a missing append is indistinguishable
+    // from an extension that chose not to append.
     return {
-      systemPrompt: `${event.systemPrompt}\n\n**EFFICIENCY RULES (follow strictly):**\n- To discover functions/classes/variables -> lsp_document_symbols (NOT read). After it, do NOT read for structure — the symbol tree is complete.\n- To check lint/type errors after editing -> lsp_diagnostics FIRST. Only read specific flagged lines.\n- To get type/signature/docs -> lsp_hover. Do NOT read surrounding block — hover returns the full type info.\n- To find definitions -> lsp_definition (NOT grep/read).\n- To assess rename impact -> lsp_references (NOT grep).\n- When lsp_diagnostics shows fixable errors -> lsp_code_action with apply=True to auto-fix.\n- For actual code body -> read specific line range (after lsp_document_symbols).\n\nWhen LSP result says "More available" with resultId, use lsp_more for next page. For hover/definition/references, put column on identifier. LSP uses 1-based line/col. Output is compact (file:line:col) — LSP calls survive compaction better than file reads.
-
-**Cross-project analysis:**
-- LSP tools are limited to project directory scopes.
-- Use lsp_add_workspace_root to add external directories into scope.
-- Use lsp_list_workspace_roots to see all directories in scope.${serverBlock}\n`,
+      systemPrompt: `${event.systemPrompt}${LSP_GUIDANCE}${serverSummary(state)}\n`,
     };
   });
 

@@ -69,6 +69,40 @@ describe("extension entrypoint", () => {
     await pi.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
     expect(ctx.ui.statuses.lsp).toBeUndefined();
   });
+
+  it("keeps the catalog-independent guidance when a prompt beats session_start initialization", async () => {
+    const pi = fakePi();
+    extension(pi.api);
+    const ctx = fakeContext();
+
+    // No session_start yet: this is what a first prompt sees when it wins the race
+    // against session_start's async config load.
+    const early = (await pi.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx)) as {
+      systemPrompt: string;
+    };
+    // The guidance does not depend on that load, so losing it would cost the whole
+    // epoch its LSP instructions for no reason.
+    expect(early.systemPrompt.startsWith("base\n\n")).toBe(true);
+    expect(early.systemPrompt).toContain("**EFFICIENCY RULES (follow strictly):**");
+    expect(early.systemPrompt).toContain("**Cross-project analysis:**");
+    // The catalog-derived half would be a guess before the config has been read, so
+    // it must be absent rather than empty-but-claimed.
+    expect(early.systemPrompt).not.toContain("Available LSP servers");
+
+    await pi.handlers.get("session_start")?.({ reason: "startup" }, ctx);
+    const configured = Number(ctx.ui.statuses.lsp?.match(/LSP: \d+\/(\d+) servers/u)?.[1] ?? "0");
+    expect(configured).toBeGreaterThan(0);
+
+    const later = (await pi.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx)) as {
+      systemPrompt: string;
+    };
+    expect(later.systemPrompt).toContain("Available LSP servers");
+    // The summary is appended after byte-identical guidance, so the only difference
+    // between the two prompts is the part that needed the config.
+    expect(later.systemPrompt.startsWith(early.systemPrompt.slice(0, -1))).toBe(true);
+
+    await pi.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+  });
 });
 
 function fakePi(): {
