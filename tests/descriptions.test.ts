@@ -146,28 +146,46 @@ describe("tool descriptions advertise .md support", () => {
   });
 });
 
-describe("tool descriptions point to discovery mechanism", () => {
+describe("tool descriptions point to discovery mechanism once", () => {
   if (!loaded) return;
 
-  const toolsWithDiscovery = [
-    "lsp_hover",
-    "lsp_definition",
-    "lsp_references",
-    "lsp_document_symbols",
-    "lsp_diagnostics",
-  ];
-
-  for (const name of toolsWithDiscovery) {
-    const tool = tools.find((t) => t.name === name);
-    it(`${name} description references lsp_list_workspace_roots for server discovery`, () => {
+  it("distinguishes position-based tools from file-only document symbols", () => {
+    for (const name of ["lsp_hover", "lsp_definition", "lsp_references"]) {
+      const tool = tools.find((candidate) => candidate.name === name);
       assert.ok(tool, `${name} tool not registered`);
-      const desc = tool!.description.toLowerCase();
       assert.ok(
-        desc.includes("lsp_list_workspace_roots"),
-        `"${name}" description does not mention lsp_list_workspace_roots:\n  "${tool!.description}"`,
+        tool!.description.includes("1-based `line` and `column`"),
+        `${name} must state that it needs a 1-based position`,
       );
+    }
+
+    const documentSymbols = tools.find((candidate) => candidate.name === "lsp_document_symbols");
+    assert.ok(documentSymbols, "lsp_document_symbols tool not registered");
+    assert.ok(documentSymbols!.description.includes("only `filePath`"));
+    assert.ok(documentSymbols!.description.includes("no line or column is required"));
+  });
+
+  it("keeps the shared server-discovery explanation on the first tool only", () => {
+    const toolsWithDiscovery = [
+      "lsp_diagnostics",
+      "lsp_hover",
+      "lsp_definition",
+      "lsp_references",
+      "lsp_document_symbols",
+    ];
+    const descriptions = toolsWithDiscovery.map((name) => {
+      const tool = tools.find((candidate) => candidate.name === name);
+      assert.ok(tool, `${name} tool not registered`);
+      return tool!.description;
     });
-  }
+
+    assert.ok(descriptions[0]!.includes("lsp_list_workspace_roots"));
+    assert.equal(
+      descriptions.filter((description) => description.includes("lsp_list_workspace_roots")).length,
+      1,
+      "server-discovery guidance should not be repeated across tool descriptions",
+    );
+  });
 });
 
 describe("prompt guidelines for read tool mention LSP alternatives", () => {
