@@ -602,7 +602,7 @@ const ReferencesParams = Type.Object({
   column: Type.Integer({
     minimum: 1,
     description:
-      "1-based column/character number. For symbol queries, place it on the identifier token.",
+      "1-based column/character position.",
   }),
   includeDeclaration: Type.Optional(
     Type.Boolean({
