@@ -742,7 +742,7 @@ export function registerLspTools(
     name: "lsp_hover",
     label: "LSP Hover",
     description:
-      "Get hover/type information for a symbol at a 1-based line and column. Works on any file type with a configured LSP server (including .md via marksman) — use lsp_list_workspace_roots to see which servers are active.",
+      "Get hover/type information for a symbol at `filePath` and 1-based `line` and `column`; place the column on the identifier. Supports .md via marksman.",
     promptSnippet:
       "Fetch hover/type information for a symbol at a 1-based line and column.",
     promptGuidelines: [
@@ -776,7 +776,7 @@ export function registerLspTools(
     name: "lsp_definition",
     label: "LSP Definition",
     description:
-      "Find definition locations for the symbol at a source position. line and column are 1-based. On .md files this navigates to heading, anchor, and wiki-link targets. Use lsp_list_workspace_roots to see configured servers.",
+      "Find definition locations for the symbol at `filePath` and 1-based `line` and `column`. On .md files this navigates to heading, anchor, and wiki-link targets.",
     promptSnippet:
       "Jump to definitions for a symbol at a 1-based line and column.",
     promptGuidelines: [
@@ -811,7 +811,7 @@ export function registerLspTools(
     name: "lsp_references",
     label: "LSP References",
     description:
-      "Find references for the symbol at a source position. line and column are 1-based. On .md files this finds backlinks to headings, tags, and wiki-link targets. Use lsp_list_workspace_roots to see configured servers.",
+      "Find references for the symbol at `filePath` and 1-based `line` and `column`. On .md files this finds backlinks to headings, tags, and wiki-link targets.",
     promptSnippet: "Find references for a symbol at a 1-based line and column.",
     promptGuidelines: [
       "Use lsp_references to assess impact before renames, API changes, or behavior changes. Put line/column on the identifier token itself; set includeDeclaration when you need the declaration included in the results.",
@@ -846,7 +846,7 @@ export function registerLspTools(
     name: "lsp_document_symbols",
     label: "LSP Document Symbols",
     description:
-      "List symbols in a source file using its configured language server. Only needs filePath — no line/col required. Works on .md files (headings, sections) and all other file types with configured LSP servers — use lsp_list_workspace_roots to see what's available.",
+      "List symbols in a source file using only `filePath` — no line or column is required. Supports .md headings and sections.",
     promptSnippet:
       "List functions, classes, variables, and other symbols in a source file.",
     promptGuidelines: [
