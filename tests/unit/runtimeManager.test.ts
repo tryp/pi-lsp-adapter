@@ -9,6 +9,8 @@ import {
   HoverRequest,
   InitializeRequest,
   PublishDiagnosticsNotification,
+  ShutdownRequest,
+  ExitNotification,
 } from "vscode-languageserver-protocol";
 import type { Disposable } from "vscode-jsonrpc";
 import {
@@ -88,6 +90,104 @@ describe("LspRuntimeManager", () => {
     await vi.waitFor(() => expect(runtime.prunedMissingRootClients).toBe(1));
 
     expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([otherRoot]);
+  });
+
+  it("does not prune the cached client for the root used by the current call", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "export const value = 1;\n", "utf8");
+    const otherRoot = join(tempDir, "other-project");
+    await mkdir(join(otherRoot, "src"), { recursive: true });
+    await writeFile(join(otherRoot, "package.json"), "{}\n", "utf8");
+    await writeFile(join(otherRoot, "src", "index.ts"), "export const other = 1;\n", "utf8");
+    const runtime = runtimeManager();
+    const baseTime = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(baseTime);
+
+    try {
+      await runtime.diagnostics("src/index.ts");
+      await rm(projectDir, { recursive: true, force: true });
+
+      const ownRootCall = await runtime.startServer("vtsls");
+      expect(ownRootCall[0]?.status).toBe("already-running");
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      expect(runtime.prunedMissingRootClients).toBe(0);
+      expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([projectDir]);
+
+      await runtime.addWorkspaceRoot(otherRoot);
+      now.mockReturnValue(baseTime + 30_001);
+      await runtime.diagnostics(join(otherRoot, "src", "index.ts"));
+      await vi.waitFor(() => expect(runtime.prunedMissingRootClients).toBe(1));
+      expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([otherRoot]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("runs only one missing-root shutdown pass when ensureClient calls overlap", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "export const value = 1;\n", "utf8");
+    const otherRoot = join(tempDir, "other-project");
+    await mkdir(join(otherRoot, "src"), { recursive: true });
+    await writeFile(join(otherRoot, "package.json"), "{}\n", "utf8");
+    await writeFile(join(otherRoot, "src", "index.ts"), "export const other = 1;\n", "utf8");
+
+    let releaseShutdown!: () => void;
+    const shutdownGate = new Promise<void>((resolve) => {
+      releaseShutdown = resolve;
+    });
+    let notifyShutdownStarted!: () => void;
+    const shutdownStarted = new Promise<void>((resolve) => {
+      notifyShutdownStarted = resolve;
+    });
+    let shutdownRequests = 0;
+    let exitNotifications = 0;
+    class CountingShutdownConnection extends FakeConnection {
+      override async sendRequest<R>(method: string): Promise<R> {
+        if (method === ShutdownRequest.method) {
+          shutdownRequests += 1;
+          notifyShutdownStarted();
+          await shutdownGate;
+          return null as R;
+        }
+        return super.sendRequest<R>(method);
+      }
+
+      override async sendNotification(method: string, params?: unknown): Promise<void> {
+        if (method === ExitNotification.method) exitNotifications += 1;
+        return super.sendNotification(method, params);
+      }
+    }
+
+    const runtime = runtimeManager({
+      connectionFactory: (process) => new CountingShutdownConnection(process.pid!),
+    });
+    const baseTime = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(baseTime);
+
+    try {
+      await runtime.diagnostics("src/index.ts");
+      await runtime.addWorkspaceRoot(otherRoot);
+      await runtime.diagnostics(join(otherRoot, "src", "index.ts"));
+      await rm(projectDir, { recursive: true, force: true });
+
+      now.mockReturnValue(baseTime + 30_001);
+      const first = runtime.diagnostics(join(otherRoot, "src", "index.ts"));
+      await shutdownStarted;
+
+      now.mockReturnValue(baseTime + 60_002);
+      const second = runtime.diagnostics(join(otherRoot, "src", "index.ts"));
+      await Promise.all([first, second]);
+      releaseShutdown();
+      await vi.waitFor(() => expect(exitNotifications).toBeGreaterThan(0));
+      await vi.waitFor(() => expect(runtime.prunedMissingRootClients).toBe(1));
+
+      expect(shutdownRequests).toBe(1);
+      expect(exitNotifications).toBe(1);
+      expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([otherRoot]);
+    } finally {
+      releaseShutdown();
+      now.mockRestore();
+    }
   });
 
   it("keeps an existing root client through repeated prune passes", async () => {

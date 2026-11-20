@@ -235,6 +235,7 @@ export class LspRuntimeManager {
   private readonly autoWorkspaceRootMode: "trusted" | "all" | "off";
   private autoAddedRootCount = 0;
   private lastMissingRootPruneAt: number | undefined;
+  private missingRootPruneInFlight: Promise<void> | undefined;
   private _prunedMissingRootClients = 0;
   private readonly clients = new Map<string, LspClient>();
   private readonly starting = new Map<string, Promise<ClientTarget>>();
@@ -1163,10 +1164,10 @@ export class LspRuntimeManager {
   }
 
   private async ensureClient(input: EnsureClientInput): Promise<ClientTarget> {
-    void this.pruneClientsWithMissingRoots().catch(() => {});
     const server = input.server;
     const rootDir = resolve(input.rootDir);
     const key = clientKey(server.id, rootDir);
+    void this.pruneClientsWithMissingRoots(key).catch(() => {});
     const existing = this.clients.get(key);
     if (existing && !existing.isExited) {
       return { client: existing, serverId: server.id, rootDir, started: false };
@@ -1246,7 +1247,8 @@ export class LspRuntimeManager {
     return Object.keys(lockfile.servers).filter((serverId) => this.config.catalog.servers[serverId] !== undefined);
   }
 
-  private async pruneClientsWithMissingRoots(): Promise<void> {
+  private async pruneClientsWithMissingRoots(exceptKey: string): Promise<void> {
+    if (this.missingRootPruneInFlight) return;
     if (this.clients.size === 0) return;
     const now = Date.now();
     if (
@@ -1256,9 +1258,19 @@ export class LspRuntimeManager {
       return;
     this.lastMissingRootPruneAt = now;
 
+    const pass = this.pruneMissingRootClients(exceptKey);
+    this.missingRootPruneInFlight = pass;
+    try {
+      await pass;
+    } finally {
+      if (this.missingRootPruneInFlight === pass) this.missingRootPruneInFlight = undefined;
+    }
+  }
+
+  private async pruneMissingRootClients(exceptKey: string): Promise<void> {
     const doomed = new Set<LspClient>();
-    for (const client of this.clients.values()) {
-      if (isMissingRootDirectory(client.rootDir)) doomed.add(client);
+    for (const [key, client] of this.clients) {
+      if (key !== exceptKey && isMissingRootDirectory(client.rootDir)) doomed.add(client);
     }
     if (doomed.size === 0) return;
 
