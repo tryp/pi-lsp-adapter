@@ -28,6 +28,11 @@ function snapshot(overrides: Partial<LspStatusSnapshot> = {}): LspStatusSnapshot
 }
 
 describe("formatLspStatus auto-diag block", () => {
+  it("reports the cumulative missing-root client prune count", () => {
+    const text = formatLspStatus(snapshot({ prunedMissingRootClients: 2 }));
+    expect(text).toContain("clients pruned for missing roots: 2");
+  });
+
   it("reports the effective wait bound per server, marking the default", () => {
     const text = formatLspStatus(snapshot());
 

@@ -15,6 +15,8 @@ export interface LspStatusSnapshot {
   autoDiagStats?: ReturnType<typeof getAutoDiagStats>;
   /** Cumulative outside-workspace refusals for this session. */
   workspaceScopeStats?: ReturnType<typeof getWorkspaceScopeStats>;
+  /** Clients shut down because their worktree roots disappeared this session. */
+  prunedMissingRootClients?: number;
 }
 
 /**
@@ -39,6 +41,9 @@ export function formatLspStatus(snapshot: LspStatusSnapshot): string {
   lines.push(`warmup: ${snapshot.config.warmup ? "enabled" : "disabled"}`);
   lines.push(`servers: ${Object.keys(snapshot.config.catalog.servers).length}`);
   lines.push(`tracked processes: ${snapshot.processes.length}`);
+  if (snapshot.prunedMissingRootClients !== undefined) {
+    lines.push(`clients pruned for missing roots: ${snapshot.prunedMissingRootClients}`);
+  }
 
   if (snapshot.config.warnings.length > 0) {
     lines.push("", "warnings:");

@@ -214,6 +214,7 @@ async function buildSnapshot(state: LspExtensionState): Promise<LspStatusSnapsho
     config: state.config,
     lockfile: await readLockfile(),
     processes: await state.processRegistry.list(),
+    prunedMissingRootClients: state.runtimeManager.prunedMissingRootClients,
     autoDiagStats: stats.edits > 0 ? stats : undefined,
     workspaceScopeStats: scopeTotal > 0 ? scope : undefined,
   };

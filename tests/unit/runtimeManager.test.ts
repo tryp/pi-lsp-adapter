@@ -15,6 +15,8 @@ import {
   LspRuntimeManager,
   MAX_AUTO_ADDED_ROOTS,
   MAX_DIAGNOSTICS_WAIT_MS,
+  isMissingRootDirectory,
+  isMissingRootStatError,
   type OutsideWorkspaceRefusal,
 } from "../../src/lsp/runtimeManager.js";
 import type { LspConnection, LspServerProcess } from "../../src/lsp/client.js";
@@ -67,6 +69,87 @@ describe("LspRuntimeManager", () => {
     await expect(runtime.registry.list()).resolves.toEqual([
       expect.objectContaining({ serverId: "vtsls", rootDir: projectDir, pid: 5000, ownerPid: process.pid }),
     ]);
+  });
+
+  it("shuts down a cached client after its workspace root is removed", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "export const value = 1;\n", "utf8");
+    const otherRoot = join(tempDir, "other-project");
+    await mkdir(join(otherRoot, "src"), { recursive: true });
+    await writeFile(join(otherRoot, "package.json"), "{}\n", "utf8");
+    await writeFile(join(otherRoot, "src", "index.ts"), "export const other = 1;\n", "utf8");
+    const runtime = runtimeManager();
+
+    await runtime.diagnostics("src/index.ts");
+    expect(runtime.activeClients()).toHaveLength(1);
+    await rm(projectDir, { recursive: true, force: true });
+    await runtime.addWorkspaceRoot(otherRoot);
+    await runtime.diagnostics(join(otherRoot, "src", "index.ts"));
+    await vi.waitFor(() => expect(runtime.prunedMissingRootClients).toBe(1));
+
+    expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([otherRoot]);
+  });
+
+  it("keeps an existing root client through repeated prune passes", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "export const value = 1;\n", "utf8");
+    const runtime = runtimeManager();
+    const baseTime = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(baseTime);
+
+    try {
+      await runtime.diagnostics("src/index.ts");
+      await runtime.diagnostics("src/index.ts");
+      now.mockReturnValue(baseTime + 30_001);
+      await runtime.diagnostics("src/index.ts");
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([projectDir]);
+    expect(runtime.prunedMissingRootClients).toBe(0);
+  });
+
+  it("classifies only ENOENT and ENOTDIR as missing-root stat errors", async () => {
+    expect(isMissingRootStatError({ code: "ENOENT" })).toBe(true);
+    expect(isMissingRootStatError({ code: "ENOTDIR" })).toBe(true);
+    for (const code of ["EACCES", "EPERM", "ELOOP", "EIO", "UNKNOWN"]) {
+      expect(isMissingRootStatError({ code })).toBe(false);
+    }
+    expect(isMissingRootDirectory(projectDir)).toBe(false);
+    const rootFile = join(tempDir, "not-a-directory");
+    await writeFile(rootFile, "file\n", "utf8");
+    expect(isMissingRootDirectory(rootFile)).toBe(true);
+  });
+
+  it("throttles repeated missing-root pruning across ensureClient calls", async () => {
+    await writeFile(join(projectDir, "package.json"), "{}\n", "utf8");
+    await writeFile(join(projectDir, "src", "index.ts"), "export const value = 1;\n", "utf8");
+    const otherRoot = join(tempDir, "other-project");
+    await mkdir(join(otherRoot, "src"), { recursive: true });
+    await writeFile(join(otherRoot, "package.json"), "{}\n", "utf8");
+    await writeFile(join(otherRoot, "src", "index.ts"), "export const other = 1;\n", "utf8");
+    const runtime = runtimeManager();
+    const baseTime = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(baseTime);
+
+    try {
+      await runtime.diagnostics("src/index.ts");
+      await runtime.diagnostics("src/index.ts"); // first prune pass sees the existing root
+      await rm(projectDir, { recursive: true, force: true });
+      await runtime.addWorkspaceRoot(otherRoot);
+      await runtime.diagnostics(join(otherRoot, "src", "index.ts")); // inside throttle window
+      await vi.waitFor(() => expect(runtime.activeClients()).toHaveLength(2));
+      expect(runtime.prunedMissingRootClients).toBe(0);
+
+      now.mockReturnValue(baseTime + 30_001);
+      await runtime.diagnostics(join(otherRoot, "src", "index.ts"));
+      await vi.waitFor(() => expect(runtime.prunedMissingRootClients).toBe(1));
+    } finally {
+      now.mockRestore();
+    }
+
+    expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([otherRoot]);
   });
 
   it("falls back to cwd as root when no root marker is found", async () => {

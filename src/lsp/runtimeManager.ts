@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, parse, relative, resolve } from "node:path";
@@ -114,6 +114,7 @@ export interface OutsideWorkspaceRefusal {
  * never publishes at all.
  */
 export const DEFAULT_DIAGNOSTICS_WAIT_MS = 5_000;
+const MISSING_ROOT_PRUNE_INTERVAL_MS = 30_000;
 
 /**
  * Hard ceiling for any configured diagnostics wait.
@@ -233,6 +234,8 @@ export class LspRuntimeManager {
   private readonly autoWorkspaceRoots: string[];
   private readonly autoWorkspaceRootMode: "trusted" | "all" | "off";
   private autoAddedRootCount = 0;
+  private lastMissingRootPruneAt: number | undefined;
+  private _prunedMissingRootClients = 0;
   private readonly clients = new Map<string, LspClient>();
   private readonly starting = new Map<string, Promise<ClientTarget>>();
   private readonly filetypeCache = new Map<string, string>();
@@ -999,6 +1002,10 @@ export class LspRuntimeManager {
     return results;
   }
 
+  get prunedMissingRootClients(): number {
+    return this._prunedMissingRootClients;
+  }
+
   activeClients(): Array<{ id: string; serverId: string; rootDir: string }> {
     const active: Array<{ id: string; serverId: string; rootDir: string }> = [];
     for (const client of this.clients.values()) {
@@ -1156,6 +1163,7 @@ export class LspRuntimeManager {
   }
 
   private async ensureClient(input: EnsureClientInput): Promise<ClientTarget> {
+    void this.pruneClientsWithMissingRoots().catch(() => {});
     const server = input.server;
     const rootDir = resolve(input.rootDir);
     const key = clientKey(server.id, rootDir);
@@ -1236,6 +1244,26 @@ export class LspRuntimeManager {
   private async installedServerIds(): Promise<string[]> {
     const lockfile = await readLockfile(this.lockfileOptions);
     return Object.keys(lockfile.servers).filter((serverId) => this.config.catalog.servers[serverId] !== undefined);
+  }
+
+  private async pruneClientsWithMissingRoots(): Promise<void> {
+    if (this.clients.size === 0) return;
+    const now = Date.now();
+    if (
+      this.lastMissingRootPruneAt !== undefined &&
+      now - this.lastMissingRootPruneAt < MISSING_ROOT_PRUNE_INTERVAL_MS
+    )
+      return;
+    this.lastMissingRootPruneAt = now;
+
+    const doomed = new Set<LspClient>();
+    for (const client of this.clients.values()) {
+      if (isMissingRootDirectory(client.rootDir)) doomed.add(client);
+    }
+    if (doomed.size === 0) return;
+
+    const results = await this.shutdownClients((client) => doomed.has(client));
+    this._prunedMissingRootClients += results.filter((result) => result.stopped).length;
   }
 
   private async shutdownClients(predicate: (client: LspClient) => boolean): Promise<ClientShutdownResult[]> {
@@ -1430,6 +1458,19 @@ export class LspRuntimeManager {
   private isInsideAnyWorkspace(targetPath: string): boolean {
     return this.workspaceRoots.some((root) => isPathInside(root, targetPath));
   }
+}
+
+export function isMissingRootDirectory(rootDir: string): boolean {
+  try {
+    return !statSync(rootDir).isDirectory();
+  } catch (error) {
+    return isMissingRootStatError(error);
+  }
+}
+
+export function isMissingRootStatError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 function clientKey(serverId: string, rootDir: string): string {
